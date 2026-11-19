@@ -1,4 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/acir_fuzzer", "crates/ledger_core"]
+members = [
+    "crates/acir_fuzzer",
+    "crates/ledger_core",
+    "crates/evil_prover_harness",
+    "crates/smt_checker",
+]
 

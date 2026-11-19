@@ -206,7 +206,7 @@ Pure Rust state-transition library (no consensus/network assumptions):
 | :--- | :--- | :--- | :--- |
 | **Stage 1: Relational Witness Fuzzer** | Rust (`acvm` + `bb`) | Apply single-wire perturbations (`+1`, `-1`, `0`, `p-1`, `2^64`) AND **multi-wire relational mutations** (paired value shifts, `u64` boundary swaps, `leaf_index` aliases, dummy edge cases). | Any invariant-violating witness survives ACIR solving or passes `bb verify`. |
 | **Stage 2: Evil Prover Swarm** | Adversarial scripts + `bb` | Fix compiled ACIR; synthesize malicious witnesses targeting overflow, dummy notes, off-curve pubkeys, and nullifier reuse against real `bb prove && bb verify`. | Confirmed exploit passing `bb verify`. |
-| **Stage 3: Compositional Formal Proof** | **NAVe** (`pedrotbtl/nave`) + `cvc5` (`QF_FF`) | Translate ACIR gadgets (`ValueConservation`, `Nullifier`, `CurveCheck`, `MerkleStep`) to SMT-LIB finite fields and prove witness determinism / uniqueness (`exists x, w1, w2: C(x, w1) /\ C(x, w2) /\ (y1 != y2)`). | `cvc5` returns `SAT` and counterexample replays against `bb verify`. |
+| **Stage 3: Formal ACIR Proof (`smt_checker`)** | Rust (`crates/smt_checker`) + `cvc5` (`ALL`: `(_ FiniteField p)` + UF + `QF_LIA`) | Translate compiled Noir 1.0.0 ACIR directly into solved-form SMT-LIB finite-field + uninterpreted-function formulas (implementing NAVe's ACIR-to-cvc5 semantics natively for Noir 1.0.0), audit `RANGE` opcodes, prove BN254 `ValueConservation` non-wrap (`QF_LIA`), and verify 1-copy invariants + 2-copy uniqueness (`exists x, w1, w2: C(x, w1) /\ C(x, w2) /\ (y1 != y2)`). | `cvc5` returns `SAT` (on invariant/uniqueness) or `UNSAT` (on witness consistency), or any `RANGE` bound is missing. |
 | **Stage 4: CI Security Gate** | Script / GitHub Actions | Enforce `--deny-warnings`, block unvetted `unconstrained fn`, and run Stages 1–3 on every PR. | Any check fails or regresses. |
 
 ---
@@ -219,7 +219,7 @@ Phase 1 completes when all five gates pass:
 2. **Performance Gate:** Client-side UltraHonk proof generation benchmarks `< 2.0s` on a mid-range smartphone (`noir_rs` / Swoir / NoirAndroid).
 3. **Fuzzing Gate:** `acir_fuzzer` reports zero unexpected unconstrained or relationally exploitable witness wires across all three circuits.
 4. **Adversarial Gate:** At least 50 independent Evil Prover runs yield zero verified exploits against `bb verify`.
-5. **Formal Gate:** **NAVe** + `cvc5` (`QF_FF`) uniqueness proofs pass on `ValueConservation`, `Nullifier`, and `CurveCheck` sub-gadgets (with Poseidon2 permutation stubbed as an uninterpreted function).
+5. **Formal Gate:** `crates/smt_checker` + `cvc5` (`(_ FiniteField p)` + UF + `QF_LIA`) formal proofs pass across all three compiled ACIR artifacts (`shield`, `unshield`, `shielded_transfer`), covering witness consistency, `RANGE` audit, `ValueConservation` non-wrap, full-ACIR invariants, and 2-copy uniqueness.
 
 ### Phase 3 Handoff Note (Offline Mesh Architecture)
 

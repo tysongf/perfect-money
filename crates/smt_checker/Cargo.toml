@@ -1,0 +1,15 @@
+[package]
+name = "smt_checker"
+version = "0.1.0"
+edition = "2024"
+description = "Stage 3 formal verification: translates Noir 1.0.0 ACIR to SMT-LIB for cvc5 finite-field & QF_LIA proofs"
+
+[dependencies]
+acir = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0", features = ["bn254"] }
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+num-bigint = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
