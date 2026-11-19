@@ -1,6 +1,12 @@
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::crypto::sha256_raw;
+use chacha20poly1305::{
+    XChaCha20Poly1305,
+    aead::{Aead, KeyInit, Payload},
+};
+use zeroize::Zeroizing;
+
+use crate::crypto::{fill_os_random, sha256_raw};
 use crate::error::VoucherError;
 use crate::types::VoucherBundle;
 use crate::wire::{
@@ -140,69 +146,73 @@ impl OfflineTransport for BleGattChannel {
     }
 }
 
-/// Opaque encrypted envelope carried by opportunistically connected mesh couriers.
+/// Opaque XChaCha20-Poly1305 AEAD envelope carried by opportunistically connected mesh couriers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshEnvelope {
     pub envelope_id: [u8; 32],
     pub created_at: u64,
     pub expires_at: u64,
-    pub nonce: [u8; 16],
+    pub nonce: [u8; 24],
     pub ciphertext: Vec<u8>,
-    pub mac: [u8; 32],
 }
 
-fn keystream_xor(shared_secret: &[u8; 32], nonce: &[u8; 16], input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    for (block_idx, chunk) in input.chunks(32).enumerate() {
-        let block = sha256_raw(&[
-            b"PM_MESH_STREAM_V1|",
-            shared_secret,
-            nonce,
-            &(block_idx as u64).to_le_bytes(),
-        ]);
-        for (i, b) in chunk.iter().enumerate() {
-            out.push(b ^ block[i]);
-        }
-    }
-    out
+fn mesh_aead_key(shared_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(sha256_raw(&[b"PM_MESH_AEAD_KEY_V2|", shared_secret]))
 }
 
-fn envelope_mac(
-    shared_secret: &[u8; 32],
-    created_at: u64,
-    expires_at: u64,
-    nonce: &[u8; 16],
-    ciphertext: &[u8],
-) -> [u8; 32] {
-    sha256_raw(&[
-        b"PM_MESH_MAC_V1|",
-        shared_secret,
-        &created_at.to_le_bytes(),
-        &expires_at.to_le_bytes(),
-        nonce,
-        ciphertext,
-    ])
+fn mesh_aad(created_at: u64, expires_at: u64) -> [u8; 31] {
+    let mut aad = [0u8; 31];
+    aad[..15].copy_from_slice(b"PM_MESH_AAD_V2|");
+    aad[15..23].copy_from_slice(&created_at.to_le_bytes());
+    aad[23..31].copy_from_slice(&expires_at.to_le_bytes());
+    aad
 }
 
 pub fn seal_bundle_for_mesh(
     bundle: &VoucherBundle,
     shared_secret: &[u8; 32],
-    nonce: [u8; 16],
+    nonce: [u8; 24],
     created_at: u64,
     expires_at: u64,
 ) -> MeshEnvelope {
-    let plaintext = encode_frame(&encode_bundle(bundle));
-    let ciphertext = keystream_xor(shared_secret, &nonce, &plaintext);
-    let mac = envelope_mac(shared_secret, created_at, expires_at, &nonce, &ciphertext);
-    let envelope_id = sha256_raw(&[b"PM_MESH_ID_V1|", &mac, &nonce]);
+    let plaintext = Zeroizing::new(encode_frame(&encode_bundle(bundle)));
+    let key = mesh_aead_key(shared_secret);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let aad = mesh_aad(created_at, expires_at);
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: plaintext.as_ref(),
+                aad: &aad,
+            },
+        )
+        .expect("XChaCha20-Poly1305 encryption cannot fail");
+    let envelope_id = sha256_raw(&[b"PM_MESH_ID_V2|", &nonce, &ciphertext]);
     MeshEnvelope {
         envelope_id,
         created_at,
         expires_at,
         nonce,
         ciphertext,
-        mac,
     }
+}
+
+pub fn seal_bundle_for_mesh_random(
+    bundle: &VoucherBundle,
+    shared_secret: &[u8; 32],
+    created_at: u64,
+    expires_at: u64,
+) -> Result<MeshEnvelope, VoucherError> {
+    let mut nonce = [0u8; 24];
+    fill_os_random(&mut nonce)?;
+    Ok(seal_bundle_for_mesh(
+        bundle,
+        shared_secret,
+        nonce,
+        created_at,
+        expires_at,
+    ))
 }
 
 pub fn open_bundle_from_mesh(
@@ -215,19 +225,22 @@ pub fn open_bundle_from_mesh(
             "mesh envelope expired".to_string(),
         ));
     }
-    let expected_mac = envelope_mac(
-        shared_secret,
-        env.created_at,
-        env.expires_at,
-        &env.nonce,
-        &env.ciphertext,
+    let key = mesh_aead_key(shared_secret);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let aad = mesh_aad(env.created_at, env.expires_at);
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                (&env.nonce).into(),
+                Payload {
+                    msg: env.ciphertext.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                VoucherError::TransportError("mesh envelope authentication failed".to_string())
+            })?,
     );
-    if env.mac != expected_mac {
-        return Err(VoucherError::TransportError(
-            "mesh envelope authentication failed".to_string(),
-        ));
-    }
-    let plaintext = keystream_xor(shared_secret, &env.nonce, &env.ciphertext);
     let payload = decode_frame(&plaintext)?;
     decode_bundle(&payload)
 }

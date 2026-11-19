@@ -1,6 +1,10 @@
 use acir::{AcirField, FieldElement};
 use anyhow::{Result, bail};
-use hmac::{Hmac, KeyInit, Mac};
+use chacha20poly1305::{
+    XChaCha20Poly1305,
+    aead::{Aead, KeyInit, Payload},
+};
+use hkdf::Hkdf;
 use ledger_core::{
     GrumpkinPoint, Note, compute_note_commitment,
     crypto::{grumpkin_scalar_mul, is_on_grumpkin},
@@ -8,19 +12,19 @@ use ledger_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::address::PaymentAddress;
 
-type HmacSha256 = Hmac<Sha256>;
-
 const FIXED_PLAINTEXT_HEAD: usize = 75; // value(8) + blinding(32) + diversifier(32) + nonce(1) + memo_len(2)
 
+/// Authenticated Grumpkin ECDH + XChaCha20-Poly1305 note ciphertext.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedNote {
     pub epk_x_hex: String,
     pub epk_y_hex: String,
+    pub nonce_hex: String,
     pub ciphertext_hex: String,
-    pub tag_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,55 +52,26 @@ pub fn field_from_hex(s: &str) -> Result<FieldElement> {
     FieldElement::from_hex(s).ok_or_else(|| anyhow::anyhow!("invalid field hex: {s}"))
 }
 
-fn derive_ecdh_keys(shared: &GrumpkinPoint, epk: &GrumpkinPoint) -> ([u8; 32], [u8; 32]) {
-    let mut enc_h = Sha256::new();
-    enc_h.update(b"PM_NOTE_ENC_V1|");
-    enc_h.update(shared.x.to_be_bytes());
-    enc_h.update(shared.y.to_be_bytes());
-    enc_h.update(epk.x.to_be_bytes());
-    enc_h.update(epk.y.to_be_bytes());
-    let enc_key: [u8; 32] = enc_h.finalize().into();
-
-    let mut mac_h = Sha256::new();
-    mac_h.update(b"PM_NOTE_MAC_V1|");
-    mac_h.update(shared.x.to_be_bytes());
-    mac_h.update(shared.y.to_be_bytes());
-    mac_h.update(epk.x.to_be_bytes());
-    mac_h.update(epk.y.to_be_bytes());
-    let mac_key: [u8; 32] = mac_h.finalize().into();
-
-    (enc_key, mac_key)
+fn derive_note_aead_key(shared: &GrumpkinPoint, epk: &GrumpkinPoint) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(128));
+    ikm.extend_from_slice(&shared.x.to_be_bytes());
+    ikm.extend_from_slice(&shared.y.to_be_bytes());
+    ikm.extend_from_slice(&epk.x.to_be_bytes());
+    ikm.extend_from_slice(&epk.y.to_be_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(b"PM_NOTE_AEAD_V2"), &ikm);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(b"xchacha20poly1305-key", &mut *key)
+        .expect("32-byte HKDF expand cannot fail");
+    key
 }
 
-pub(crate) fn sha256_ctr_xor(key: &[u8; 32], nonce_tag: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    for (idx, chunk) in data.chunks(32).enumerate() {
-        let mut h = Sha256::new();
-        h.update(b"PM_CTR_V1|");
-        h.update(key);
-        h.update(nonce_tag);
-        h.update((idx as u64).to_le_bytes());
-        let mask = h.finalize();
-        for (i, b) in chunk.iter().enumerate() {
-            out.push(b ^ mask[i]);
-        }
-    }
-    out
-}
-
-fn note_hmac_tag(
-    mac_key: &[u8; 32],
-    cm: FieldElement,
-    epk: &GrumpkinPoint,
-    ciphertext: &[u8],
-) -> [u8; 32] {
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(mac_key).expect("32-byte key");
-    mac.update(b"PM_NOTE_TAG_V1|");
-    mac.update(&cm.to_be_bytes());
-    mac.update(&epk.x.to_be_bytes());
-    mac.update(&epk.y.to_be_bytes());
-    mac.update(ciphertext);
-    mac.finalize().into_bytes().into()
+fn note_aad(cm: FieldElement, epk: &GrumpkinPoint) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(15 + 96);
+    aad.extend_from_slice(b"PM_NOTE_AAD_V2|");
+    aad.extend_from_slice(&cm.to_be_bytes());
+    aad.extend_from_slice(&epk.x.to_be_bytes());
+    aad.extend_from_slice(&epk.y.to_be_bytes());
+    aad
 }
 
 pub fn encrypt_note(
@@ -123,9 +98,9 @@ pub fn encrypt_note(
 
     let epk = grumpkin_scalar_mul(recipient.g_d, esk)?;
     let shared = grumpkin_scalar_mul(recipient.pk_d, esk)?;
-    let (enc_key, mac_key) = derive_ecdh_keys(&shared, &epk);
+    let key = derive_note_aead_key(&shared, &epk);
 
-    let mut plain = Vec::with_capacity(FIXED_PLAINTEXT_HEAD + memo_bytes.len());
+    let mut plain = Zeroizing::new(Vec::with_capacity(FIXED_PLAINTEXT_HEAD + memo_bytes.len()));
     plain.extend_from_slice(&note.value.to_le_bytes());
     plain.extend_from_slice(&note.blinding.to_be_bytes());
     plain.extend_from_slice(&recipient.diversifier.to_be_bytes());
@@ -133,14 +108,26 @@ pub fn encrypt_note(
     plain.extend_from_slice(&(memo_bytes.len() as u16).to_le_bytes());
     plain.extend_from_slice(memo_bytes);
 
-    let ciphertext = sha256_ctr_xor(&enc_key, &cm.to_be_bytes(), &plain);
-    let tag = note_hmac_tag(&mac_key, cm, &epk, &ciphertext);
+    let mut nonce = [0u8; 24];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| anyhow::anyhow!("OS CSPRNG note nonce failure: {e}"))?;
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let aad = note_aad(cm, &epk);
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: plain.as_ref(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("note XChaCha20-Poly1305 encryption failed"))?;
 
     Ok(EncryptedNote {
         epk_x_hex: field_to_hex(epk.x),
         epk_y_hex: field_to_hex(epk.y),
+        nonce_hex: hex::encode(nonce),
         ciphertext_hex: hex::encode(ciphertext),
-        tag_hex: hex::encode(tag),
     })
 }
 
@@ -156,24 +143,28 @@ pub fn try_decrypt_note(
     if !is_on_grumpkin(epk.x, epk.y) {
         return None;
     }
+    let nonce: [u8; 24] = hex::decode(&enc.nonce_hex).ok()?.try_into().ok()?;
     let ciphertext = hex::decode(&enc.ciphertext_hex).ok()?;
-    let tag = hex::decode(&enc.tag_hex).ok()?;
-    if ciphertext.len() < FIXED_PLAINTEXT_HEAD || tag.len() != 32 {
+    if ciphertext.len() < FIXED_PLAINTEXT_HEAD + 16 {
         return None;
     }
 
     let shared = grumpkin_scalar_mul(epk, ivk).ok()?;
-    let (enc_key, mac_key) = derive_ecdh_keys(&shared, &epk);
+    let key = derive_note_aead_key(&shared, &epk);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let aad = note_aad(cm, &epk);
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: ciphertext.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .ok()?,
+    );
 
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&mac_key).ok()?;
-    mac.update(b"PM_NOTE_TAG_V1|");
-    mac.update(&cm.to_be_bytes());
-    mac.update(&epk.x.to_be_bytes());
-    mac.update(&epk.y.to_be_bytes());
-    mac.update(&ciphertext);
-    mac.verify_slice(&tag).ok()?;
-
-    let plain = sha256_ctr_xor(&enc_key, &cm.to_be_bytes(), &ciphertext);
     if plain.len() < FIXED_PLAINTEXT_HEAD {
         return None;
     }
@@ -224,14 +215,14 @@ fn hash_encrypted_note_into(hasher: &mut Sha256, enc: &EncryptedNote) {
     hasher.update(b"|");
     hasher.update(enc.epk_y_hex.as_bytes());
     hasher.update(b"|");
-    hasher.update(enc.ciphertext_hex.as_bytes());
+    hasher.update(enc.nonce_hex.as_bytes());
     hasher.update(b"|");
-    hasher.update(enc.tag_hex.as_bytes());
+    hasher.update(enc.ciphertext_hex.as_bytes());
 }
 
 pub fn compute_shield_tx_binding_hash(chain_id: u64, enc: &EncryptedNote) -> FieldElement {
     let mut h = Sha256::new();
-    h.update(b"PM_SHIELD_BIND_V1|");
+    h.update(b"PM_SHIELD_BIND_V2|");
     h.update(chain_id.to_le_bytes());
     hash_encrypted_note_into(&mut h, enc);
     digest_to_nonzero_field(h.finalize().into())
@@ -239,7 +230,7 @@ pub fn compute_shield_tx_binding_hash(chain_id: u64, enc: &EncryptedNote) -> Fie
 
 pub fn compute_transfer_tx_binding_hash(chain_id: u64, encs: &[EncryptedNote; 2]) -> FieldElement {
     let mut h = Sha256::new();
-    h.update(b"PM_TRANSFER_BIND_V1|");
+    h.update(b"PM_TRANSFER_BIND_V2|");
     h.update(chain_id.to_le_bytes());
     hash_encrypted_note_into(&mut h, &encs[0]);
     h.update(b"||");
@@ -252,9 +243,8 @@ pub fn compute_unshield_change_binding_hash(
     change_enc: &EncryptedNote,
 ) -> FieldElement {
     let mut h = Sha256::new();
-    h.update(b"PM_UNSHIELD_BIND_V1|");
+    h.update(b"PM_UNSHIELD_BIND_V2|");
     h.update(chain_id.to_le_bytes());
     hash_encrypted_note_into(&mut h, change_enc);
     digest_to_nonzero_field(h.finalize().into())
 }
-

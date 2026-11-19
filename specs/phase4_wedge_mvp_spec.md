@@ -39,26 +39,27 @@ A shielded payment address binds a wallet's diversified generator and public poi
 When shielding, transferring, or unshielding with change, the sender publishes an `EncryptedNote` on-chain (`tx_binding_hash` commits to the ciphertexts so node relays cannot swap encrypted memos):
 
 1. **Sender Encryption (`encrypt_note`):**
-   * Sample non-zero ephemeral scalar `esk` and compute `epk = esk * g_d` and `shared = esk * pk_d` on Grumpkin (`ledger_core::crypto::grumpkin_scalar_mul`).
-   * Derive `enc_key = SHA-256("PM_NOTE_ENC_V1|" || shared.x || shared.y || epk.x || epk.y)` and `mac_key = SHA-256("PM_NOTE_MAC_V1|" || shared.x || shared.y || epk.x || epk.y)`.
+   * Sample OS-CSPRNG non-zero ephemeral scalar `esk` and compute `epk = esk * g_d` and `shared = esk * pk_d` on Grumpkin (`ledger_core::crypto::grumpkin_scalar_mul`).
+   * Derive `Zeroizing<[u8; 32]>` AEAD key via **HKDF-SHA256** (`info = "xchacha20poly1305-key"`, `salt = "PM_NOTE_AEAD_V2"`).
    * Serialize canonical plaintext: `value (8B LE) || blinding (32B BE) || diversifier (32B BE) || nonce (1B) || memo_len (2B LE) || memo_utf8`.
-   * Encrypt via SHA-256 CTR keystream and compute `tag = HMAC-SHA256(mac_key, "PM_NOTE_TAG_V1|" || cm || epk || ciphertext)`.
+   * Encrypt via **XChaCha20-Poly1305** (`24`-byte OS CSPRNG nonce) with AAD binding `(cm, epk.x, epk.y)`.
 2. **Receiver / Watch-Only Scanning (`try_decrypt_note`):**
    * `WatchOnlyWallet` holds only Incoming Viewing Key `ivk` (optionally `nk` for spent detection), NEVER `ask`.
-   * Checks `is_on_grumpkin(epk.x, epk.y)`, derives `shared = ivk * epk` (`== esk * pk_d`), verifies HMAC tag before decrypting, reconstructs `pk_d = derive_diversified_address(ivk, diversifier)`, verifies `addr.nonce == nonce` and `compute_note_commitment(note) == cm`.
+   * Checks `is_on_grumpkin(epk.x, epk.y)`, derives `shared = ivk * epk` (`== esk * pk_d`), verifies XChaCha20-Poly1305 tag + AAD before decrypting, reconstructs `pk_d = derive_diversified_address(ivk, diversifier)`, verifies `addr.nonce == nonce` and `compute_note_commitment(note) == cm`.
 3. **Transaction Ciphertext Binding (`tx_binding_hash`):**
-   * `PM_SHIELD_BIND_V1`: binds `(chain_id, encrypted_note)`.
-   * `PM_TRANSFER_BIND_V1`: binds `(chain_id, out_enc[0], out_enc[1])`.
+   * `PM_SHIELD_BIND_V2`: binds `(chain_id, encrypted_note)`.
+   * `PM_TRANSFER_BIND_V2`: binds `(chain_id, out_enc[0], out_enc[1])`.
    * `PM_POCKET_FUND_BIND_V1` / `PM_VOUCHER_SETTLE_BIND_V1` / `PM_POCKET_RECLAIM_BIND_V1`: Phase 3 pocket escrow bindings verified on settlement.
 
 ---
 
-## 4. Encrypted Wallet Keystore (`crates/pm_sdk/src/keystore.rs`)
+## 4. BIP-39 Recovery & Encrypted Wallet Keystore (`mnemonic.rs`, `keystore.rs`)
 
-Wallet state (`ask`, `next_diversifier`, UTXO notes, serialized `PersistedEnclaveState`, `recovery_sk`, `merchant_sk`, `pending_merchant_bundles`, and cached `AttestationTrustStore` / CRL) is persisted atomically as JSON-wrapped authenticated ciphertext:
+Wallet state (`ask`, `next_diversifier`, UTXO notes, serialized `PersistedEnclaveState`, `recovery_sk`, `merchant_sk`, `pending_merchant_bundles`, and cached `AttestationTrustStore` / CRL) is backed by two hardened layers:
 
-* **KDF:** `10,000` iterated `HMAC-SHA256` rounds over passphrase with a `16`-byte salt deriving independent `enc_key` and `mac_key`.
-* **Cipher + Integrity:** `16`-byte nonce SHA-256 CTR stream encryption + `HMAC-SHA256(mac_key, version || kdf_rounds || salt || nonce || ciphertext)`. Wrong passphrases or single-bit keystore edits fail authentication before deserialization.
+* **BIP-39 + HKDF-SHA256 Root Derivation (`mnemonic.rs`):** 12-word (`128`-bit OS entropy) or 24-word (`256`-bit OS entropy) English mnemonics derive independent spend (`ask`), pocket device (`device_p256`), backup drain (`recovery_p256`), merchant settlement (`settle_p256`), and serial secrets using `HKDF-SHA256` (`Zeroizing` scrubbed after use).
+* **KDF:** **Argon2id v0x13** (`19 MiB` memory, `t = 2`, `p = 1` OWASP production default; opt-in `--fast-kdf` for rapid debug/CI CLI runs) with a `16`-byte OS CSPRNG salt.
+* **AEAD + AAD Integrity:** **XChaCha20-Poly1305** (`24`-byte OS CSPRNG nonce) binding `(version || m_cost || t_cost || p_cost || salt || nonce)` in Poly1305 AAD so wrong passphrases or parameter/ciphertext edits fail authentication before deserialization.
 
 ---
 

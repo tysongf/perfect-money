@@ -45,9 +45,15 @@ cargo run --release -p smt_checker -- --report "$ROOT_DIR/target/smt_checker_rep
 
 echo ""
 echo "============================================================"
-echo "==> Gate 5: Full Rust Workspace Tests (unit, canary, parity, e2e)"
+echo "==> Gate 5: Full Rust Workspace Tests (Phases 1, 3, & 4)"
 echo "============================================================"
-cargo test --workspace
+cargo test --workspace --all-targets
+
+echo ""
+echo "============================================================"
+echo "==> Gate 6: Phase 2 Monetary & Adversarial Red-Team Swarm"
+echo "============================================================"
+bash "$ROOT_DIR/scripts/run_red_team_suite.sh"
 
 echo ""
 echo "ALL CI SECURITY GATES PASSED."

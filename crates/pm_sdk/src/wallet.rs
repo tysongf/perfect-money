@@ -10,16 +10,19 @@ use offline_vouchers::{
     AttestationTrustStore, BleGattChannel, CloseStatement, DEFAULT_MAX_CLOCK_SKEW_SECS,
     DEFAULT_MAX_HOPS_ALLOWED, DEFAULT_MAX_POCKET_BALANCE, DEFAULT_MAX_VOUCHER_TTL_SECS,
     DEFAULT_MERCHANT_MAX_HOPS, NfcTapChannel, OfflineMerchantWallet, OfflineTransport,
-    PocketPolicy, SecurityLevel, SoftwareMockEnclave, VendorCa, VoucherBundle,
+    PocketPolicy, SecureEnclave, SecurityLevel, SoftwareMockEnclave, VendorCa, VoucherBundle,
     compressed_pk, compute_pocket_fund_binding_hash, compute_pocket_reclaim_binding_hash,
     compute_voucher_settle_binding_hash, decode_bundle, decode_frame, encode_bundle, encode_frame,
-    sign_hop_endorsement, signing_key_from_seed, SecureEnclave,
+    fill_os_random, sign_hop_endorsement, signing_key_from_seed,
 };
 use p256::ecdsa::SigningKey;
 use sha2::{Digest, Sha256};
 
 use crate::address::PaymentAddress;
 use crate::keystore::{OwnedNoteRecord, WalletSnapshot};
+use crate::mnemonic::{
+    Mnemonic, MnemonicWords, derive_wallet_secrets, generate_mnemonic,
+};
 use crate::note_crypto::{
     EncryptedNote, compute_shield_tx_binding_hash, compute_transfer_tx_binding_hash,
     encrypt_note, field_from_hex, field_to_hex, try_decrypt_note,
@@ -55,6 +58,8 @@ pub fn dev_default_policy() -> PocketPolicy {
         max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
         max_hops_allowed: DEFAULT_MAX_HOPS_ALLOWED,
         default_merchant_max_hops: DEFAULT_MERCHANT_MAX_HOPS,
+        allowed_webauthn_rp_id: None,
+        require_webauthn_uv: true,
     }
 }
 
@@ -199,28 +204,15 @@ pub struct ClientWallet {
 }
 
 impl ClientWallet {
-    pub fn new_from_seed(seed_tag: &str, cert_now_secs: u64) -> Result<Self> {
-        let ask = derive_nonzero_field(&[b"PM_WALLET_ASK_V1|", seed_tag.as_bytes()]);
+    fn from_root_secrets(
+        ask: FieldElement,
+        dev_sk: SigningKey,
+        recovery_sk: SigningKey,
+        merchant_sk: SigningKey,
+        serial: [u8; 16],
+        cert_now_secs: u64,
+    ) -> Result<Self> {
         let keys = WalletKeys::from_ask(ask)?;
-
-        let mut dev_seed = Vec::new();
-        dev_seed.extend_from_slice(b"dev:");
-        dev_seed.extend_from_slice(seed_tag.as_bytes());
-        let dev_sk = signing_key_from_seed(&dev_seed);
-
-        let mut rec_seed = Vec::new();
-        rec_seed.extend_from_slice(b"rec:");
-        rec_seed.extend_from_slice(seed_tag.as_bytes());
-        let recovery_sk = signing_key_from_seed(&rec_seed);
-
-        let mut merch_seed = Vec::new();
-        merch_seed.extend_from_slice(b"merch:");
-        merch_seed.extend_from_slice(seed_tag.as_bytes());
-        let merchant_sk = signing_key_from_seed(&merch_seed);
-
-        let serial_digest: [u8; 32] = Sha256::digest([b"serial:", seed_tag.as_bytes()].concat()).into();
-        let serial: [u8; 16] = serial_digest[..16].try_into().unwrap();
-
         let policy = dev_default_policy();
         let ca = dev_vendor_ca();
         let trust = default_dev_trust_store();
@@ -251,6 +243,43 @@ impl ClientWallet {
             merchant_wallet,
             policy,
         })
+    }
+
+    pub fn new_from_seed(seed_tag: &str, cert_now_secs: u64) -> Result<Self> {
+        let ask = derive_nonzero_field(&[b"PM_WALLET_ASK_V1|", seed_tag.as_bytes()]);
+        let dev_sk = signing_key_from_seed(&[b"dev:", seed_tag.as_bytes()].concat());
+        let recovery_sk = signing_key_from_seed(&[b"rec:", seed_tag.as_bytes()].concat());
+        let merchant_sk = signing_key_from_seed(&[b"merch:", seed_tag.as_bytes()].concat());
+        let serial_digest: [u8; 32] =
+            Sha256::digest([b"serial:", seed_tag.as_bytes()].concat()).into();
+        let serial: [u8; 16] = serial_digest[..16].try_into().unwrap();
+        Self::from_root_secrets(ask, dev_sk, recovery_sk, merchant_sk, serial, cert_now_secs)
+    }
+
+    pub fn new_from_mnemonic(
+        mnemonic: &Mnemonic,
+        bip39_passphrase: &str,
+        cert_now_secs: u64,
+    ) -> Result<Self> {
+        let secrets = derive_wallet_secrets(mnemonic, bip39_passphrase)?;
+        Self::from_root_secrets(
+            secrets.ask,
+            secrets.device_sk,
+            secrets.recovery_sk,
+            secrets.merchant_sk,
+            secrets.cert_serial,
+            cert_now_secs,
+        )
+    }
+
+    pub fn new_random(words: MnemonicWords, cert_now_secs: u64) -> Result<(Self, Mnemonic)> {
+        let mnemonic = generate_mnemonic(words)?;
+        let wallet = Self::new_from_mnemonic(&mnemonic, "", cert_now_secs)?;
+        Ok((wallet, mnemonic))
+    }
+
+    pub fn enable_webauthn(&mut self, rp_id: impl Into<String>, origin: impl Into<String>) {
+        self.enclave.enable_webauthn(rp_id, origin);
     }
 
     pub fn to_snapshot(&self) -> WalletSnapshot {
@@ -305,9 +334,10 @@ impl ClientWallet {
             Some(policy.max_hops_allowed),
         )?;
         for b in &snap.pending_merchant_bundles {
-            merchant_wallet
-                .seen_vouchers
-                .insert((b.voucher.pocket_id, b.voucher.counter), b.voucher.clone());
+            merchant_wallet.seen_vouchers.insert(
+                (b.voucher.pocket_id, b.voucher.counter),
+                (b.voucher.clone(), b.webauthn_assertion.clone()),
+            );
         }
         merchant_wallet.accepted_bundles = snap.pending_merchant_bundles;
 
@@ -342,15 +372,15 @@ impl ClientWallet {
         Ok(PaymentAddress::from_diversified(addr))
     }
 
-    fn next_secret_field(&mut self, tag: &[u8]) -> FieldElement {
-        let seq = self.next_diversifier;
-        self.next_diversifier += 1;
-        derive_nonzero_field(&[
-            b"PM_SECRET_V1|",
-            tag,
-            &self.keys.ask.to_be_bytes(),
-            &seq.to_le_bytes(),
-        ])
+    fn next_secret_field(&mut self, _tag: &[u8]) -> FieldElement {
+        loop {
+            let mut raw = [0u8; 32];
+            getrandom::fill(&mut raw).expect("OS CSPRNG unavailable for note blinding/esk");
+            let f = FieldElement::from_be_bytes_reduce(&raw);
+            if !f.is_zero() {
+                return f;
+            }
+        }
     }
 
     pub fn shielded_balance(&self) -> u64 {
@@ -643,18 +673,8 @@ impl ClientWallet {
         now_secs: u64,
         ttl_secs: u64,
     ) -> Result<VoucherBundle> {
-        let ctr = self.enclave.counter() + 1;
-        let nonce_digest: [u8; 32] = Sha256::digest(
-            [
-                b"PM_OFFLINE_NONCE_V1|".as_slice(),
-                &self.enclave.pocket_id().0,
-                &ctr.to_le_bytes(),
-                &now_secs.to_le_bytes(),
-            ]
-            .concat(),
-        )
-        .into();
-        let nonce: [u8; 16] = nonce_digest[..16].try_into().unwrap();
+        let mut nonce = [0u8; 16];
+        fill_os_random(&mut nonce)?;
         Ok(self
             .enclave
             .issue_voucher(recipient_pk, amount, now_secs, ttl_secs, nonce)?)
@@ -666,16 +686,8 @@ impl ClientWallet {
         to_pk: [u8; 33],
         expires_at: u64,
     ) -> Result<VoucherBundle> {
-        let nonce_digest: [u8; 32] = Sha256::digest(
-            [
-                b"PM_HOP_NONCE_V1|".as_slice(),
-                &bundle.voucher.hash(),
-                &[bundle.hops.len() as u8],
-            ]
-            .concat(),
-        )
-        .into();
-        let nonce: [u8; 16] = nonce_digest[..16].try_into().unwrap();
+        let mut nonce = [0u8; 16];
+        fill_os_random(&mut nonce)?;
         Ok(sign_hop_endorsement(
             &self.merchant_sk,
             bundle,

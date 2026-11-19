@@ -79,6 +79,16 @@ pub enum VoucherError {
     WireError(String),
     #[error("offline transport error: {0}")]
     TransportError(String),
+    #[error("invalid WebAuthn assertion: {0}")]
+    InvalidWebAuthnAssertion(String),
+    #[error("WebAuthn RP ID hash mismatch")]
+    WebAuthnRpIdMismatch,
+    #[error("WebAuthn challenge mismatch")]
+    WebAuthnChallengeMismatch,
+    #[error("WebAuthn user verification (UV) required")]
+    WebAuthnUserVerificationRequired,
+    #[error("WebAuthn signCount regression: previous {prev}, got {got}")]
+    WebAuthnSignCountRegression { prev: u32, got: u32 },
     #[error("ledger error: {0}")]
     Ledger(#[from] LedgerError),
 }

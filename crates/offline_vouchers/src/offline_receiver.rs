@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::error::VoucherError;
 use crate::types::{
     AttestationTrustStore, EquivocationFraudProof, OfflineVoucher, PocketId, PocketPolicy,
-    VoucherBundle,
+    VoucherBundle, WebAuthnAssertion, check_webauthn_sign_count_monotonic,
 };
 
 /// Air-gapped merchant/receiver wallet performing offline hardware attestation,
@@ -14,7 +14,7 @@ pub struct OfflineMerchantWallet {
     pub trust_store: AttestationTrustStore,
     pub policy: PocketPolicy,
     pub max_accepted_hops: u8,
-    pub seen_vouchers: BTreeMap<(PocketId, u64), OfflineVoucher>,
+    pub seen_vouchers: BTreeMap<(PocketId, u64), (OfflineVoucher, Option<WebAuthnAssertion>)>,
     pub detected_equivocations: Vec<EquivocationFraudProof>,
     pub accepted_bundles: Vec<VoucherBundle>,
 }
@@ -64,25 +64,39 @@ impl OfflineMerchantWallet {
             return Err(VoucherError::PocketIdMismatch);
         }
         v.verify_common(&self.policy, now_secs)?;
-        v.verify_signature(&bundle.attestation.device_pk)?;
+        let sign_count_opt =
+            bundle.verify_voucher_signature(&bundle.attestation.device_pk, &self.policy)?;
 
         let final_holder = bundle.verify_hop_chain(&self.policy, self.max_accepted_hops, now_secs)?;
         if final_holder != self.merchant_pk {
             return Err(VoucherError::RecipientMismatch);
         }
 
-        if let Some(prev) = self.seen_vouchers.get(&(v.pocket_id, v.counter)) {
+        if let Some((prev, prev_wa)) = self.seen_vouchers.get(&(v.pocket_id, v.counter)) {
             if prev.hash() == v.hash() {
                 return Err(VoucherError::VoucherAlreadySettled(v.counter));
             }
             self.detected_equivocations.push(EquivocationFraudProof {
                 voucher_a: prev.clone(),
                 voucher_b: v.clone(),
+                webauthn_a: prev_wa.clone(),
+                webauthn_b: bundle.webauthn_assertion.clone(),
             });
             return Err(VoucherError::EquivocationDetected { counter: v.counter });
         }
 
-        for ((pid, seen_ctr), seen_v) in &self.seen_vouchers {
+        if let Some(sc) = sign_count_opt {
+            check_webauthn_sign_count_monotonic(
+                v.counter,
+                sc,
+                self.seen_vouchers
+                    .iter()
+                    .filter(|((pid, _), _)| pid == &v.pocket_id)
+                    .map(|((_, ctr), (_, wa))| (*ctr, wa.as_ref())),
+            )?;
+        }
+
+        for ((pid, seen_ctr), (seen_v, _)) in &self.seen_vouchers {
             if pid != &v.pocket_id {
                 continue;
             }
@@ -99,7 +113,10 @@ impl OfflineMerchantWallet {
         }
 
         let vhash = v.hash();
-        self.seen_vouchers.insert((v.pocket_id, v.counter), v.clone());
+        self.seen_vouchers.insert(
+            (v.pocket_id, v.counter),
+            (v.clone(), bundle.webauthn_assertion.clone()),
+        );
         self.accepted_bundles.push(bundle.clone());
         Ok(vhash)
     }

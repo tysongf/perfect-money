@@ -109,7 +109,8 @@ All offline signatures use **NIST P-256 (`secp256r1`) ECDSA** over `SHA-256(doma
 * **Authenticated Envelope (`PMV1` Frame):** Magic `b"PMV1"` (`4B`) + length (`4B LE`) + payload + truncated `SHA-256` checksum (`4B`) = `12B` framing overhead.
 * **NFC NDEF Channel (`NfcTapChannel`):** Encodes framed `VoucherBundle` inside an NDEF external-type record (`TNF = 0x04`, type `b"pm:v1"`, `<= 4096 B`), well under a single Android HCE / Apple CoreNFC APDU exchange (`~420 B` single-hop bundle).
 * **BLE GATT Channel (`BleGattChannel`):** Fragments frames into `BleChunk` packets (`session_id: u16, seq: u16, total: u16, data`) supporting legacy **MTU `20`** (`14B` payload chunks) and BLE 5.x **MTU `247`**, with out-of-order reassembly, duplicate chunk tolerance, and checksum verification.
-* **Store-and-Forward Mesh (`EncryptedMeshRelay`):** Wraps settlement payloads into opaque `MeshEnvelope` ciphertexts (`SHA-256` stream cipher + MAC keyed to receiver secret) with duplicate `envelope_id` suppression and TTL expiration, allowing nearby couriers to carry offline payments to internet gateways without learning amounts, identities, or voucher hashes.
+* **Store-and-Forward Mesh (`EncryptedMeshRelay`):** Wraps settlement payloads into opaque `MeshEnvelope` ciphertexts using **XChaCha20-Poly1305** (`24`-byte OS CSPRNG nonce, authenticated `created_at || expires_at` AAD, 16-byte Poly1305 tag) with duplicate `envelope_id` suppression and TTL expiration, allowing couriers to carry offline payments without learning amounts, identities, or voucher hashes.
+* **Dual-Mode Hardware Verification (Raw ECDSA + WebAuthn/Passkey P-256):** Enclaves can emit either raw 64-byte P-256 low-S signatures or W3C WebAuthn Passkey assertions (`authenticatorData` + `clientDataJSON` `challenge == voucher.hash()` + `RP ID` hash + `UP|UV` flags + monotonic `signCount`) via `VoucherBundle::verify_voucher_signature` and `CloseStatement::verify_signature_with_policy`.
 
 ---
 

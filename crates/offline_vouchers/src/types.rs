@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
     DOMAIN_HW_ATTEST, DOMAIN_OFFLINE_VOUCHER, DOMAIN_POCKET_CLOSE, DOMAIN_POCKET_DRAIN,
-    DOMAIN_VOUCHER_HOP, derive_pocket_id, serde_hex_33, serde_hex_64, sha256_domain, verify_low_s,
+    DOMAIN_VOUCHER_HOP, derive_pocket_id, serde_hex_33, serde_hex_64, sha256_domain,
+    verify_low_s, verify_webauthn_p256_low_s,
 };
 use crate::error::VoucherError;
 
@@ -17,6 +18,65 @@ pub const DEFAULT_MAX_VOUCHER_TTL_SECS: u64 = 604_800;
 pub const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub const DEFAULT_MAX_HOPS_ALLOWED: u8 = 3;
 pub const DEFAULT_MERCHANT_MAX_HOPS: u8 = 1;
+
+fn default_require_uv() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebAuthnAssertion {
+    pub authenticator_data: Vec<u8>,
+    pub client_data_json: Vec<u8>,
+}
+
+impl WebAuthnAssertion {
+    pub fn sign_count(&self) -> Option<u32> {
+        if self.authenticator_data.len() < 37 {
+            return None;
+        }
+        Some(u32::from_be_bytes([
+            self.authenticator_data[33],
+            self.authenticator_data[34],
+            self.authenticator_data[35],
+            self.authenticator_data[36],
+        ]))
+    }
+}
+
+/// Enforces counter-ordered WebAuthn `signCount` monotonicity while allowing out-of-order delivery.
+pub fn check_webauthn_sign_count_monotonic<'a>(
+    new_counter: u64,
+    new_sc: u32,
+    existing: impl Iterator<Item = (u64, Option<&'a WebAuthnAssertion>)>,
+) -> Result<(), VoucherError> {
+    for (seen_ctr, seen_wa_opt) in existing {
+        let Some(seen_sc) = seen_wa_opt.and_then(WebAuthnAssertion::sign_count) else {
+            continue;
+        };
+        if seen_sc == 0 && new_sc == 0 {
+            continue;
+        }
+        if (seen_sc > 0 && new_sc == 0) || (seen_sc == 0 && new_sc > 0) {
+            return Err(VoucherError::WebAuthnSignCountRegression {
+                prev: seen_sc,
+                got: new_sc,
+            });
+        }
+        if seen_ctr < new_counter && new_sc <= seen_sc {
+            return Err(VoucherError::WebAuthnSignCountRegression {
+                prev: seen_sc,
+                got: new_sc,
+            });
+        }
+        if seen_ctr > new_counter && new_sc >= seen_sc {
+            return Err(VoucherError::WebAuthnSignCountRegression {
+                prev: seen_sc,
+                got: new_sc,
+            });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PocketId(pub [u8; 32]);
@@ -31,6 +91,10 @@ pub struct PocketPolicy {
     pub max_clock_skew_secs: u64,
     pub max_hops_allowed: u8,
     pub default_merchant_max_hops: u8,
+    #[serde(default)]
+    pub allowed_webauthn_rp_id: Option<String>,
+    #[serde(default = "default_require_uv")]
+    pub require_webauthn_uv: bool,
 }
 
 impl Default for PocketPolicy {
@@ -44,6 +108,8 @@ impl Default for PocketPolicy {
             max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
             max_hops_allowed: DEFAULT_MAX_HOPS_ALLOWED,
             default_merchant_max_hops: DEFAULT_MERCHANT_MAX_HOPS,
+            allowed_webauthn_rp_id: None,
+            require_webauthn_uv: true,
         }
     }
 }
@@ -344,6 +410,35 @@ pub struct VoucherBundle {
     pub voucher: OfflineVoucher,
     pub attestation: HardwareAttestation,
     pub hops: Vec<HopEndorsement>,
+    #[serde(default)]
+    pub webauthn_assertion: Option<WebAuthnAssertion>,
+}
+
+/// Shared signature check supporting both raw hardware P-256 ECDSA and W3C WebAuthn assertions.
+pub fn verify_voucher_sig_or_webauthn(
+    voucher: &OfflineVoucher,
+    webauthn_assertion: Option<&WebAuthnAssertion>,
+    device_pk: &[u8; 33],
+    policy: &PocketPolicy,
+) -> Result<Option<u32>, VoucherError> {
+    match webauthn_assertion {
+        Some(wa) => {
+            let sign_count = verify_webauthn_p256_low_s(
+                device_pk,
+                &voucher.hash(),
+                policy.allowed_webauthn_rp_id.as_deref(),
+                policy.require_webauthn_uv,
+                &wa.authenticator_data,
+                &wa.client_data_json,
+                &voucher.sig,
+            )?;
+            Ok(Some(sign_count))
+        }
+        None => {
+            voucher.verify_signature(device_pk)?;
+            Ok(None)
+        }
+    }
 }
 
 impl VoucherBundle {
@@ -352,6 +447,19 @@ impl VoucherBundle {
             .last()
             .map(|h| h.to_pk)
             .unwrap_or(self.voucher.recipient_pk)
+    }
+
+    pub fn verify_voucher_signature(
+        &self,
+        device_pk: &[u8; 33],
+        policy: &PocketPolicy,
+    ) -> Result<Option<u32>, VoucherError> {
+        verify_voucher_sig_or_webauthn(
+            &self.voucher,
+            self.webauthn_assertion.as_ref(),
+            device_pk,
+            policy,
+        )
     }
 
     pub fn verify_hop_chain(
@@ -409,6 +517,8 @@ pub struct CloseStatement {
     pub closed_at: u64,
     #[serde(with = "serde_hex_64")]
     pub sig: [u8; 64],
+    #[serde(default)]
+    pub webauthn_assertion: Option<WebAuthnAssertion>,
 }
 
 impl CloseStatement {
@@ -424,6 +534,10 @@ impl CloseStatement {
         out
     }
 
+    pub fn hash(&self) -> [u8; 32] {
+        sha256_domain(DOMAIN_POCKET_CLOSE, &self.signing_bytes())
+    }
+
     pub fn verify_signature(&self, device_pk: &[u8; 33]) -> Result<(), VoucherError> {
         verify_low_s(
             device_pk,
@@ -431,6 +545,31 @@ impl CloseStatement {
             &self.signing_bytes(),
             &self.sig,
         )
+    }
+
+    pub fn verify_signature_with_policy(
+        &self,
+        device_pk: &[u8; 33],
+        policy: &PocketPolicy,
+    ) -> Result<Option<u32>, VoucherError> {
+        match &self.webauthn_assertion {
+            Some(wa) => {
+                let sc = verify_webauthn_p256_low_s(
+                    device_pk,
+                    &self.hash(),
+                    policy.allowed_webauthn_rp_id.as_deref(),
+                    policy.require_webauthn_uv,
+                    &wa.authenticator_data,
+                    &wa.client_data_json,
+                    &self.sig,
+                )?;
+                Ok(Some(sc))
+            }
+            None => {
+                self.verify_signature(device_pk)?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -466,5 +605,9 @@ impl UncooperativeDrainRequest {
 pub struct EquivocationFraudProof {
     pub voucher_a: OfflineVoucher,
     pub voucher_b: OfflineVoucher,
+    #[serde(default)]
+    pub webauthn_a: Option<WebAuthnAssertion>,
+    #[serde(default)]
+    pub webauthn_b: Option<WebAuthnAssertion>,
 }
 

@@ -261,7 +261,6 @@ pub struct MeshEnvelopeDto {
     pub expires_at: u64,
     pub nonce_hex: String,
     pub ciphertext_hex: String,
-    pub mac_hex: String,
 }
 
 impl MeshEnvelopeDto {
@@ -272,7 +271,6 @@ impl MeshEnvelopeDto {
             expires_at: env.expires_at,
             nonce_hex: hex::encode(env.nonce),
             ciphertext_hex: hex::encode(&env.ciphertext),
-            mac_hex: hex::encode(env.mac),
         }
     }
 
@@ -280,19 +278,15 @@ impl MeshEnvelopeDto {
         let envelope_id: [u8; 32] = hex::decode(&self.envelope_id_hex)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid envelope_id"))?;
-        let nonce: [u8; 16] = hex::decode(&self.nonce_hex)?
+        let nonce: [u8; 24] = hex::decode(&self.nonce_hex)?
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid nonce"))?;
-        let mac: [u8; 32] = hex::decode(&self.mac_hex)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid mac"))?;
+            .map_err(|_| anyhow::anyhow!("invalid 24-byte XChaCha nonce"))?;
         Ok(MeshEnvelope {
             envelope_id,
             created_at: self.created_at,
             expires_at: self.expires_at,
             nonce,
             ciphertext: hex::decode(&self.ciphertext_hex)?,
-            mac,
         })
     }
 }

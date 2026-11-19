@@ -12,25 +12,28 @@ pub use crypto::{
     DOMAIN_POCKET_FUND_BIND, DOMAIN_POCKET_ID, DOMAIN_POCKET_RECLAIM_BIND, DOMAIN_VOUCHER_HOP,
     DOMAIN_VOUCHER_SETTLE_BIND, compressed_pk, compute_pocket_fund_binding_hash,
     compute_pocket_reclaim_binding_hash, compute_voucher_settle_binding_hash, derive_pocket_id,
-    malleate_to_high_s, sign_low_s, signing_key_from_seed, verify_low_s,
+    fill_os_random, malleate_to_high_s, sign_low_s, sign_prehash_low_s, signing_key_from_seed,
+    verify_low_s, verify_prehash_low_s, verify_webauthn_p256_low_s,
 };
 pub use enclave::{
     CompromisedSnapshot, CompromisedTestEnclave, PersistedEnclaveState, SecureEnclave,
-    SoftwareMockEnclave, VendorCa, sign_hop_endorsement, sign_uncooperative_drain_request,
+    SoftwareMockEnclave, VendorCa, sign_challenge_webauthn, sign_hop_endorsement,
+    sign_uncooperative_drain_request,
 };
 pub use error::VoucherError;
 pub use offline_receiver::OfflineMerchantWallet;
 pub use settlement::{PocketAccount, PocketRegistry, PocketStatus};
 pub use transport::{
     BleGattChannel, EncryptedMeshRelay, MeshEnvelope, NfcTapChannel, OfflineTransport,
-    open_bundle_from_mesh, seal_bundle_for_mesh,
+    open_bundle_from_mesh, seal_bundle_for_mesh, seal_bundle_for_mesh_random,
 };
 pub use types::{
     AttestationTrustStore, CONSTITUTIONAL_HARD_CAP, CloseStatement, DEFAULT_CHAIN_ID,
     DEFAULT_MAX_CLOCK_SKEW_SECS, DEFAULT_MAX_HOPS_ALLOWED, DEFAULT_MAX_POCKET_BALANCE,
     DEFAULT_MAX_VOUCHER_TTL_SECS, DEFAULT_MERCHANT_MAX_HOPS, EquivocationFraudProof,
     HardwareAttestation, HopEndorsement, OfflineVoucher, PocketId, PocketPolicy, SecurityLevel,
-    UncooperativeDrainRequest, VOUCHER_FORMAT_VERSION, VoucherBundle,
+    UncooperativeDrainRequest, VOUCHER_FORMAT_VERSION, VoucherBundle, WebAuthnAssertion,
+    check_webauthn_sign_count_monotonic, verify_voucher_sig_or_webauthn,
 };
 pub use wire::{
     BLE_MIN_MTU, BleChunk, BleReassembler, FRAME_MAGIC, MAX_NDEF_PAYLOAD_BYTES, NfcNdefFrame,

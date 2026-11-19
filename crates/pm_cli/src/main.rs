@@ -7,11 +7,12 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ledger_core::crypto::derive_diversified_address;
 use pm_sdk::{
-    CircuitProver, ClientWallet, ClosePocketRequest, FundPocketRequest, MockProver, NargoBbProver,
-    NodeRpcClient, PaymentAddress, SettleVoucherRequest, ShieldSubmitRequest, ShieldTxDto,
-    TransferSubmitRequest, TransferTxDto, UnshieldTxDto, WatchOnlyWallet,
-    decode_bundle_transport_bytes, encode_bundle_transport_bytes, field_from_hex, field_to_hex,
-    load_encrypted_wallet, save_encrypted_wallet,
+    Argon2Params, CircuitProver, ClientWallet, ClosePocketRequest, FundPocketRequest, MnemonicWords,
+    MockProver, NargoBbProver, NodeRpcClient, PaymentAddress, SettleVoucherRequest,
+    ShieldSubmitRequest, ShieldTxDto, TransferSubmitRequest, TransferTxDto, UnshieldTxDto,
+    WatchOnlyWallet, decode_bundle_transport_bytes, encode_bundle_transport_bytes, field_from_hex,
+    field_to_hex, generate_mnemonic, load_encrypted_wallet, parse_mnemonic,
+    save_encrypted_wallet_with_params,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -42,6 +43,8 @@ struct Cli {
     circuits_dir: PathBuf,
     #[arg(long, default_value = "./target/pm_cli_prover_cache")]
     cache_dir: PathBuf,
+    #[arg(long, default_value_t = false)]
+    fast_kdf: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -55,7 +58,25 @@ enum Commands {
         #[arg(long)]
         passphrase: String,
         #[arg(long)]
-        seed: String,
+        seed: Option<String>,
+        #[arg(long, default_value_t = 12)]
+        words: usize,
+        #[arg(long, default_value = "")]
+        bip39_passphrase: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        now: Option<u64>,
+    },
+    Restore {
+        #[arg(long)]
+        wallet: PathBuf,
+        #[arg(long)]
+        passphrase: String,
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        bip39_passphrase: String,
         #[arg(long)]
         node: Option<String>,
         #[arg(long)]
@@ -216,8 +237,13 @@ fn load_wallet(path: &Path, passphrase: &str) -> Result<ClientWallet> {
     ClientWallet::from_snapshot(snap)
 }
 
-fn save_wallet(path: &Path, wallet: &ClientWallet, passphrase: &str) -> Result<()> {
-    save_encrypted_wallet(path, &wallet.to_snapshot(), passphrase)
+fn save_wallet(
+    path: &Path,
+    wallet: &ClientWallet,
+    passphrase: &str,
+    params: Argon2Params,
+) -> Result<()> {
+    save_encrypted_wallet_with_params(path, &wallet.to_snapshot(), passphrase, params)
 }
 
 fn sync_wallet_from_node(wallet: &mut ClientWallet, client: &NodeRpcClient) -> Result<usize> {
@@ -238,11 +264,18 @@ fn parse_pk33(s: &str) -> Result<[u8; 33]> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let kdf_params = if cli.fast_kdf {
+        Argon2Params::fast_test()
+    } else {
+        Argon2Params::production()
+    };
     match cli.command {
         Commands::Init {
             wallet,
             passphrase,
             seed,
+            words,
+            bip39_passphrase,
             node,
             now,
         } => {
@@ -250,14 +283,60 @@ fn main() -> Result<()> {
                 bail!("wallet file {} already exists", wallet.display());
             }
             let now_secs = current_now(now);
-            let mut w = ClientWallet::new_from_seed(&seed, now_secs)?;
+            let (mut w, mnemonic_str) = if let Some(seed_tag) = seed {
+                (ClientWallet::new_from_seed(&seed_tag, now_secs)?, None)
+            } else {
+                let word_count = match words {
+                    12 => MnemonicWords::Words12,
+                    24 => MnemonicWords::Words24,
+                    _ => bail!("--words must be 12 or 24"),
+                };
+                let mnemonic = generate_mnemonic(word_count)?;
+                let phrase = mnemonic.to_string();
+                let wallet_obj =
+                    ClientWallet::new_from_mnemonic(&mnemonic, &bip39_passphrase, now_secs)?;
+                (wallet_obj, Some(phrase))
+            };
             if let Some(url) = node {
                 let client = NodeRpcClient::new(&url);
                 sync_wallet_from_node(&mut w, &client)?;
             }
             let addr = w.next_address()?;
             let mpk_hex = hex::encode(w.merchant_public_key());
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
+            let mut out = serde_json::json!({
+                "wallet": wallet,
+                "ivk": field_to_hex(w.keys.ivk),
+                "address": addr.encode(),
+                "merchant_pk_hex": mpk_hex,
+                "pocket_id_hex": hex::encode(w.enclave.export_state().attestation.pocket_id(w.policy.chain_id).0),
+            });
+            if let Some(phrase) = mnemonic_str {
+                out["mnemonic"] = serde_json::Value::String(phrase);
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Commands::Restore {
+            wallet,
+            passphrase,
+            mnemonic,
+            bip39_passphrase,
+            node,
+            now,
+        } => {
+            if wallet.exists() {
+                bail!("wallet file {} already exists", wallet.display());
+            }
+            let parsed = parse_mnemonic(&mnemonic)?;
+            let now_secs = current_now(now);
+            let mut w = ClientWallet::new_from_mnemonic(&parsed, &bip39_passphrase, now_secs)?;
+            if let Some(url) = node {
+                let client = NodeRpcClient::new(&url);
+                sync_wallet_from_node(&mut w, &client)?;
+            }
+            let addr = w.next_address()?;
+            let mpk_hex = hex::encode(w.merchant_public_key());
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -266,6 +345,7 @@ fn main() -> Result<()> {
                     "address": addr.encode(),
                     "merchant_pk_hex": mpk_hex,
                     "pocket_id_hex": hex::encode(w.enclave.export_state().attestation.pocket_id(w.policy.chain_id).0),
+                    "shielded_balance": w.shielded_balance(),
                 }))?
             );
         }
@@ -275,7 +355,7 @@ fn main() -> Result<()> {
             let mpk_hex = hex::encode(w.merchant_public_key());
             let _watch_check: WatchOnlyWallet = w.watch_only_ivk()?;
             let _div_check = derive_diversified_address(w.keys.ivk, addr.diversifier)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -293,7 +373,7 @@ fn main() -> Result<()> {
             let mut w = load_wallet(&wallet, &passphrase)?;
             let client = NodeRpcClient::new(&node);
             let new_notes = sync_wallet_from_node(&mut w, &client)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -338,7 +418,7 @@ fn main() -> Result<()> {
                 encrypted_note,
             })?;
             sync_wallet_from_node(&mut w, &client)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::Send {
@@ -372,7 +452,7 @@ fn main() -> Result<()> {
                 encrypted_notes,
             })?;
             sync_wallet_from_node(&mut w, &client)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::PocketFund {
@@ -406,7 +486,7 @@ fn main() -> Result<()> {
             })?;
             offline_vouchers::SecureEnclave::credit_funding(&mut w.enclave, amount)?;
             sync_wallet_from_node(&mut w, &client)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::OfflinePay {
@@ -429,7 +509,7 @@ fn main() -> Result<()> {
                 }
             }
             fs::write(&out, &wire_bytes)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -453,7 +533,7 @@ fn main() -> Result<()> {
             let wire_bytes = fs::read(&input)?;
             let bundle = decode_bundle_transport_bytes(&wire_bytes, transport.as_str())?;
             let vhash = w.receive_offline_payment(&bundle, current_now(now))?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -495,13 +575,13 @@ fn main() -> Result<()> {
                     Err(e) => {
                         unsettled.extend_from_slice(&bundles[idx..]);
                         w.merchant_wallet.accepted_bundles = unsettled;
-                        save_wallet(&wallet, &w, &passphrase)?;
+                        save_wallet(&wallet, &w, &passphrase, kdf_params)?;
                         return Err(e);
                     }
                 }
             }
             sync_wallet_from_node(&mut w, &client)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -534,7 +614,7 @@ fn main() -> Result<()> {
                 now_secs,
             })?;
             sync_wallet_from_node(&mut w, &client)?;
-            save_wallet(&wallet, &w, &passphrase)?;
+            save_wallet(&wallet, &w, &passphrase, kdf_params)?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
     }

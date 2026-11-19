@@ -11,6 +11,7 @@ use crate::error::VoucherError;
 use crate::types::{
     AttestationTrustStore, CloseStatement, EquivocationFraudProof, HardwareAttestation,
     OfflineVoucher, PocketId, PocketPolicy, UncooperativeDrainRequest, VoucherBundle,
+    WebAuthnAssertion, check_webauthn_sign_count_monotonic, verify_voucher_sig_or_webauthn,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,8 @@ pub struct PocketAccount {
     pub total_funded: u64,
     pub escrow_balance: u64,
     pub total_settled: u64,
-    pub settled_counters: BTreeMap<u64, OfflineVoucher>,
+    pub settled_counters: BTreeMap<u64, (OfflineVoucher, Option<WebAuthnAssertion>)>,
+    pub last_webauthn_sign_count: u32,
     pub status: PocketStatus,
 }
 
@@ -136,6 +138,7 @@ impl PocketRegistry {
                         escrow_balance: unshield_tx.burn_amount,
                         total_settled: 0,
                         settled_counters: BTreeMap::new(),
+                        last_webauthn_sign_count: 0,
                         status: PocketStatus::Active,
                     },
                 );
@@ -181,7 +184,7 @@ impl PocketRegistry {
         };
 
         v.verify_common(&self.policy, now_secs)?;
-        v.verify_signature(&device_pk)?;
+        let sign_count_opt = bundle.verify_voucher_signature(&device_pk, &self.policy)?;
         let final_holder =
             bundle.verify_hop_chain(&self.policy, self.policy.max_hops_allowed, now_secs)?;
         if final_holder != recipient_pk {
@@ -204,18 +207,30 @@ impl PocketRegistry {
             return Err(VoucherError::TxBindingHashMismatch);
         }
 
-        // Check replay / equivocation BEFORE debiting escrow
+        // Check replay / equivocation BEFORE enforcing signCount or debiting escrow
         let existing = self
             .pockets
             .get(&v.pocket_id)
             .and_then(|a| a.settled_counters.get(&v.counter).cloned());
-        if let Some(prev) = existing {
+        if let Some((prev, _)) = existing {
             if prev.hash() == v.hash() {
                 return Err(VoucherError::VoucherAlreadySettled(v.counter));
             }
             self.revoke_and_slash_account(v.pocket_id);
             self.assert_escrow_conservation(ledger);
             return Err(VoucherError::EquivocationDetected { counter: v.counter });
+        }
+
+        if let Some(sc) = sign_count_opt {
+            if let Some(acct) = self.pockets.get(&v.pocket_id) {
+                check_webauthn_sign_count_monotonic(
+                    v.counter,
+                    sc,
+                    acct.settled_counters
+                        .iter()
+                        .map(|(&c, (_, wa))| (c, wa.as_ref())),
+                )?;
+            }
         }
 
         {
@@ -252,7 +267,13 @@ impl PocketRegistry {
             .ok_or(VoucherError::PocketNotFound)?;
         acct.escrow_balance -= v.amount;
         acct.total_settled += v.amount;
-        acct.settled_counters.insert(v.counter, v.clone());
+        if let Some(sc) = sign_count_opt {
+            if sc > acct.last_webauthn_sign_count {
+                acct.last_webauthn_sign_count = sc;
+            }
+        }
+        acct.settled_counters
+            .insert(v.counter, (v.clone(), bundle.webauthn_assertion.clone()));
 
         self.assert_escrow_conservation(ledger);
         Ok(leaf_idx)
@@ -278,9 +299,9 @@ impl PocketRegistry {
             .ok_or(VoucherError::PocketNotFound)?
             .attestation
             .device_pk;
-        a.verify_signature(&device_pk)
+        verify_voucher_sig_or_webauthn(a, proof.webauthn_a.as_ref(), &device_pk, &self.policy)
             .map_err(|_| VoucherError::InvalidEquivocationProof)?;
-        b.verify_signature(&device_pk)
+        verify_voucher_sig_or_webauthn(b, proof.webauthn_b.as_ref(), &device_pk, &self.policy)
             .map_err(|_| VoucherError::InvalidEquivocationProof)?;
 
         let slashed = self.revoke_and_slash_account(a.pocket_id);
@@ -344,7 +365,18 @@ impl PocketRegistry {
             )
         };
 
-        close_stmt.verify_signature(&device_pk)?;
+        let close_sc_opt = close_stmt.verify_signature_with_policy(&device_pk, &self.policy)?;
+        if let Some(close_sc) = close_sc_opt {
+            if let Some(acct) = self.pockets.get(&close_stmt.pocket_id) {
+                check_webauthn_sign_count_monotonic(
+                    close_stmt.final_counter.saturating_add(1),
+                    close_sc,
+                    acct.settled_counters
+                        .iter()
+                        .map(|(&c, (_, wa))| (c, wa.as_ref())),
+                )?;
+            }
+        }
         if close_stmt.final_cumulative_spent < total_settled {
             return Err(VoucherError::CloseSpentRegression);
         }
@@ -378,6 +410,11 @@ impl PocketRegistry {
             .get_mut(&close_stmt.pocket_id)
             .ok_or(VoucherError::PocketNotFound)?;
         acct.escrow_balance -= unspent_safe;
+        if let Some(close_sc) = close_sc_opt {
+            if close_sc > acct.last_webauthn_sign_count {
+                acct.last_webauthn_sign_count = close_sc;
+            }
+        }
         acct.status = PocketStatus::CooperativeClosed {
             final_counter: close_stmt.final_counter,
             final_cumulative_spent: close_stmt.final_cumulative_spent,

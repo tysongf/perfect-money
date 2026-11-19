@@ -6,8 +6,10 @@ use tempfile::TempDir;
 
 fn run_cli(args: &[&str]) -> serde_json::Value {
     let bin = env!("CARGO_BIN_EXE_pm-cli");
+    let mut full_args = vec!["--fast-kdf"];
+    full_args.extend_from_slice(args);
     let out = Command::new(bin)
-        .args(args)
+        .args(&full_args)
         .output()
         .expect("execute pm-cli binary");
     assert!(
@@ -247,6 +249,84 @@ fn test_cli_full_wallet_and_airgapped_offline_flow() {
     assert_eq!(status.total_shielded_supply, 499_000_000);
     assert_eq!(status.collected_fees, 1_000_000);
     assert_eq!(status.total_pocket_escrow, 0);
+
+    server.stop();
+}
+
+#[test]
+fn test_cli_bip39_init_and_lost_phone_restore() {
+    let engine = NodeEngine::new(Box::new(NodeMockVerifier)).unwrap();
+    let mut server = PmNodeServer::start("127.0.0.1:0", engine).unwrap();
+    let node_url = server.base_url();
+
+    let dir = TempDir::new().unwrap();
+    let wallet_a = dir.path().join("phone_a.pmk");
+    let wallet_b = dir.path().join("phone_b_restored.pmk");
+    let wallet_a_s = wallet_a.to_str().unwrap();
+    let wallet_b_s = wallet_b.to_str().unwrap();
+
+    let init_out = run_cli(&[
+        "init",
+        "--wallet",
+        wallet_a_s,
+        "--passphrase",
+        "pass-a",
+        "--words",
+        "12",
+        "--node",
+        &node_url,
+        "--now",
+        "1700000000",
+    ]);
+    let mnemonic = init_out["mnemonic"]
+        .as_str()
+        .expect("init without --seed prints BIP-39 mnemonic")
+        .to_string();
+    assert_eq!(mnemonic.split_whitespace().count(), 12);
+
+    run_cli(&["faucet", "--node", &node_url, "--amount", "250000000"]);
+    run_cli(&[
+        "shield",
+        "--wallet",
+        wallet_a_s,
+        "--passphrase",
+        "pass-a",
+        "--node",
+        &node_url,
+        "--amount",
+        "250000000",
+        "--memo",
+        "lost-phone-backup",
+        "--prover",
+        "mock",
+    ]);
+
+    let restored = run_cli(&[
+        "restore",
+        "--wallet",
+        wallet_b_s,
+        "--passphrase",
+        "pass-b",
+        "--mnemonic",
+        &mnemonic,
+        "--node",
+        &node_url,
+        "--now",
+        "1700000010",
+    ]);
+    assert_eq!(restored["ivk"], init_out["ivk"]);
+    assert_eq!(restored["merchant_pk_hex"], init_out["merchant_pk_hex"]);
+    assert_eq!(restored["pocket_id_hex"], init_out["pocket_id_hex"]);
+    assert_eq!(restored["shielded_balance"].as_u64().unwrap(), 250_000_000);
+
+    let bal = run_cli(&[
+        "balance",
+        "--wallet",
+        wallet_b_s,
+        "--passphrase",
+        "pass-b",
+    ]);
+    assert_eq!(bal["shielded_balance"].as_u64().unwrap(), 250_000_000);
 
     server.stop();
 }

@@ -147,7 +147,7 @@ fn test_e2e_wedge_mvp_real_ultrahonk_online_watch_only_and_offline_mesh() {
 
     // 5. Encrypted store-and-forward mesh relay delivers rx_v2 to gateway; out-of-order settle ctr=2 FIRST, ctr=1 SECOND
     let mesh_secret = [0x77u8; 32];
-    let env_v2 = seal_bundle_for_mesh(&rx_v2, &mesh_secret, [0x55u8; 16], now + 30, now + 7200);
+    let env_v2 = seal_bundle_for_mesh(&rx_v2, &mesh_secret, [0x55u8; 24], now + 30, now + 7200);
     let relay_resp = client
         .post_json::<_, pm_sdk::MeshRelayResponse>(
             &format!("/v1/mesh/relay?now={}", now + 35),

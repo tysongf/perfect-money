@@ -7,8 +7,13 @@ description = "Phase 4 Perfect Money client SDK: Grumpkin ECDH note encryption, 
 [dependencies]
 acir = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0", features = ["bn254"] }
 anyhow = "1.0"
+argon2 = { version = "0.6", features = ["zeroize"] }
 base64 = "0.22"
+bip39 = { version = "3.0", features = ["std", "zeroize"] }
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+getrandom = "0.4"
 hex = "0.4"
+hkdf = "0.13"
 hmac = "0.13"
 ledger_core = { path = "../ledger_core" }
 offline_vouchers = { path = "../offline_vouchers" }
@@ -16,6 +21,8 @@ p256 = { version = "0.14", default-features = false, features = ["arithmetic", "
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
+subtle = "2.6"
 tempfile = "3.14"
 thiserror = "2.0"
+zeroize = "1.9"
 

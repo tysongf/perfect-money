@@ -6,9 +6,11 @@ use ledger_core::{
     CircuitKind, LedgerState, Note, ProofVerifier, compute_note_commitment,
     derive_diversified_address,
 };
+use offline_vouchers::SecureEnclave;
 use pm_sdk::{
-    ClientWallet, MockProver, PaymentAddress, PublishedOutput, encrypt_note, field_to_hex,
-    load_encrypted_wallet, save_encrypted_wallet, try_decrypt_note,
+    ClientWallet, KEYSTORE_VERSION, MnemonicWords, MockProver, PaymentAddress, PublishedOutput,
+    encrypt_note, field_to_hex, generate_mnemonic, load_encrypted_wallet, parse_mnemonic,
+    save_encrypted_wallet, try_decrypt_note,
 };
 use tempfile::TempDir;
 
@@ -67,6 +69,10 @@ fn test_grumpkin_ecdh_encrypt_decrypt_and_watch_only() {
     let cm = compute_note_commitment(&note);
     let esk = FieldElement::from(98765u64);
     let enc = encrypt_note(&bob_addr, &note, esk, cm, "espresso").unwrap();
+    let enc2 = encrypt_note(&bob_addr, &note, esk, cm, "espresso").unwrap();
+    assert_ne!(enc.nonce_hex, enc2.nonce_hex);
+    assert_ne!(enc.ciphertext_hex, enc2.ciphertext_hex);
+    assert!(try_decrypt_note(bob.keys.ivk, cm, &enc2).is_some());
 
     let dec = try_decrypt_note(bob.keys.ivk, cm, &enc).expect("bob decrypts own note");
     assert_eq!(dec.note, note);
@@ -75,11 +81,25 @@ fn test_grumpkin_ecdh_encrypt_decrypt_and_watch_only() {
     // Wrong IVK fails trial decryption
     assert!(try_decrypt_note(eve.keys.ivk, cm, &enc).is_none());
 
-    // Commitment swap / ciphertext tampering fails
+    // Commitment swap, ciphertext tampering, and nonce tampering fail AEAD auth
     assert!(try_decrypt_note(bob.keys.ivk, cm + FieldElement::one(), &enc).is_none());
-    let mut bad_tag = enc.clone();
-    bad_tag.tag_hex = format!("ff{}", &bad_tag.tag_hex[2..]);
-    assert!(try_decrypt_note(bob.keys.ivk, cm, &bad_tag).is_none());
+    let mut bad_ct = enc.clone();
+    let ct_prefix = if bad_ct.ciphertext_hex.starts_with("ff") {
+        "00"
+    } else {
+        "ff"
+    };
+    bad_ct.ciphertext_hex = format!("{ct_prefix}{}", &bad_ct.ciphertext_hex[2..]);
+    assert!(try_decrypt_note(bob.keys.ivk, cm, &bad_ct).is_none());
+
+    let mut bad_nonce = enc.clone();
+    let nonce_prefix = if bad_nonce.nonce_hex.starts_with("ff") {
+        "00"
+    } else {
+        "ff"
+    };
+    bad_nonce.nonce_hex = format!("{nonce_prefix}{}", &bad_nonce.nonce_hex[2..]);
+    assert!(try_decrypt_note(bob.keys.ivk, cm, &bad_nonce).is_none());
 
     // Watch-only wallet scans published output cleanly with zero spend key
     let found = watch.scan_outputs(
@@ -119,6 +139,14 @@ fn test_encrypted_keystore_roundtrip_and_auth_failures() {
 
     save_encrypted_wallet(&path, &alice.to_snapshot(), "correct-horse-battery").unwrap();
 
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(val["version"].as_u64().unwrap(), u64::from(KEYSTORE_VERSION));
+    assert_eq!(val["m_cost_kib"].as_u64().unwrap(), 19_456);
+    assert_eq!(val["t_cost"].as_u64().unwrap(), 2);
+    assert_eq!(val["p_cost"].as_u64().unwrap(), 1);
+    assert_eq!(val["nonce_hex"].as_str().unwrap().len(), 48);
+
     // Wrong passphrase rejected
     assert!(load_encrypted_wallet(&path, "wrong-password").is_err());
 
@@ -130,12 +158,71 @@ fn test_encrypted_keystore_roundtrip_and_auth_failures() {
     assert_eq!(loaded.shielded_balance(), 100_000_000);
     assert_eq!(loaded.pocket_balance(), 50_000_000);
 
-    // Tampered MAC in keystore file rejected
-    let raw = std::fs::read_to_string(&path).unwrap();
-    let mut val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    val["mac_hex"] = serde_json::Value::String("00".repeat(32));
-    std::fs::write(&path, serde_json::to_vec(&val).unwrap()).unwrap();
+    // Tampered ciphertext / Poly1305 tag in keystore file rejected
+    let mut bad_ct = val.clone();
+    bad_ct["ciphertext_hex"] = serde_json::Value::String("00".repeat(32));
+    std::fs::write(&path, serde_json::to_vec(&bad_ct).unwrap()).unwrap();
     assert!(load_encrypted_wallet(&path, "correct-horse-battery").is_err());
+
+    // Tampered Argon2 parameter (bound via XChaCha20-Poly1305 AAD) rejected
+    let mut bad_param = val;
+    bad_param["m_cost_kib"] = serde_json::Value::from(1_024);
+    std::fs::write(&path, serde_json::to_vec(&bad_param).unwrap()).unwrap();
+    assert!(load_encrypted_wallet(&path, "correct-horse-battery").is_err());
+}
+
+#[test]
+fn test_bip39_12_and_24_word_hkdf_derivation_and_lost_phone_recovery() {
+    let (mut alice_12, m12) =
+        ClientWallet::new_random(MnemonicWords::Words12, 1_700_000_000).unwrap();
+    assert_eq!(m12.word_count(), 12);
+
+    let m24 = generate_mnemonic(MnemonicWords::Words24).unwrap();
+    assert_eq!(m24.word_count(), 24);
+    let parsed_24 = parse_mnemonic(&m24.to_string()).unwrap();
+    let w24_a = ClientWallet::new_from_mnemonic(&parsed_24, "", 1_700_000_000).unwrap();
+    let w24_b = ClientWallet::new_from_mnemonic(&m24, "", 1_700_000_500).unwrap();
+    assert_eq!(w24_a.keys.ask, w24_b.keys.ask);
+    assert_eq!(
+        w24_a.enclave.attestation().device_pk,
+        w24_b.enclave.attestation().device_pk
+    );
+    assert_eq!(w24_a.recovery_public_key(), w24_b.recovery_public_key());
+    assert_eq!(w24_a.merchant_public_key(), w24_b.merchant_public_key());
+    assert_eq!(w24_a.enclave.pocket_id(), w24_b.enclave.pocket_id());
+
+    // Distinct BIP-39 passphrase derives completely distinct keys
+    let w24_pass =
+        ClientWallet::new_from_mnemonic(&m24, "bip39-extra-secret", 1_700_000_000).unwrap();
+    assert_ne!(w24_pass.keys.ask, w24_a.keys.ask);
+    assert_ne!(w24_pass.merchant_public_key(), w24_a.merchant_public_key());
+    assert_ne!(w24_pass.recovery_public_key(), w24_a.recovery_public_key());
+
+    // Invalid mnemonic fails parsing
+    assert!(parse_mnemonic("abandon abandon invalidword notreal").is_err());
+
+    // Lost-phone recovery restores shielded notes from published chain outputs
+    let verifier = AcceptAllVerifier;
+    let prover = MockProver;
+    let mut ledger = LedgerState::new();
+    ledger.mint_vault_supply(75_000_000).unwrap();
+    let (s_tx, s_enc) = alice_12.build_shield(&prover, 75_000_000, "phone-backup").unwrap();
+    let idx = ledger.apply_shield(&s_tx, &verifier).unwrap();
+    let published = vec![PublishedOutput {
+        leaf_index: idx,
+        commitment_hex: field_to_hex(s_tx.out_commitment),
+        encrypted_note: s_enc,
+    }];
+
+    let parsed_12 = parse_mnemonic(&m12.to_string()).unwrap();
+    let mut recovered = ClientWallet::new_from_mnemonic(&parsed_12, "", 1_700_001_000).unwrap();
+    assert_eq!(recovered.keys.ask, alice_12.keys.ask);
+    assert_eq!(
+        recovered.enclave.attestation().device_pk,
+        alice_12.enclave.attestation().device_pk
+    );
+    assert_eq!(recovered.scan_outputs(&published, &BTreeSet::new()), 1);
+    assert_eq!(recovered.shielded_balance(), 75_000_000);
 }
 
 #[test]

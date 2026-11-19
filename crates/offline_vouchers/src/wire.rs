@@ -2,7 +2,7 @@ use crate::crypto::sha256_raw;
 use crate::error::VoucherError;
 use crate::types::{
     CloseStatement, HardwareAttestation, HopEndorsement, OfflineVoucher, PocketId, SecurityLevel,
-    VOUCHER_FORMAT_VERSION, VoucherBundle,
+    VOUCHER_FORMAT_VERSION, VoucherBundle, WebAuthnAssertion,
 };
 
 pub const FRAME_MAGIC: &[u8; 4] = b"PMV1";
@@ -46,6 +46,11 @@ impl<'a> ByteReader<'a> {
         let mut arr = [0u8; 8];
         arr.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(arr))
+    }
+
+    fn read_vec_u16(&mut self) -> Result<Vec<u8>, VoucherError> {
+        let n = self.read_u16()? as usize;
+        Ok(self.take(n)?.to_vec())
     }
 
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], VoucherError> {
@@ -155,16 +160,54 @@ fn decode_hop_inner(r: &mut ByteReader<'_>) -> Result<HopEndorsement, VoucherErr
     })
 }
 
+fn encode_optional_webauthn(wa_opt: Option<&WebAuthnAssertion>, out: &mut Vec<u8>) {
+    match wa_opt {
+        None => out.push(0),
+        Some(wa) => {
+            out.push(1);
+            out.extend_from_slice(&(wa.authenticator_data.len() as u16).to_le_bytes());
+            out.extend_from_slice(&wa.authenticator_data);
+            out.extend_from_slice(&(wa.client_data_json.len() as u16).to_le_bytes());
+            out.extend_from_slice(&wa.client_data_json);
+        }
+    }
+}
+
+fn decode_optional_webauthn(r: &mut ByteReader<'_>) -> Result<Option<WebAuthnAssertion>, VoucherError> {
+    match r.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let authenticator_data = r.read_vec_u16()?;
+            let client_data_json = r.read_vec_u16()?;
+            Ok(Some(WebAuthnAssertion {
+                authenticator_data,
+                client_data_json,
+            }))
+        }
+        other => Err(VoucherError::WireError(format!(
+            "invalid webauthn flag {other}"
+        ))),
+    }
+}
+
 pub fn encode_bundle(bundle: &VoucherBundle) -> Vec<u8> {
     let v = encode_voucher(&bundle.voucher);
     let att = encode_attestation(&bundle.attestation);
-    let mut out = Vec::with_capacity(v.len() + att.len() + 1 + bundle.hops.len() * HopEndorsement::WIRE_SIZE);
+    let extra = bundle
+        .webauthn_assertion
+        .as_ref()
+        .map(|w| 4 + w.authenticator_data.len() + w.client_data_json.len())
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(
+        v.len() + att.len() + 2 + bundle.hops.len() * HopEndorsement::WIRE_SIZE + extra,
+    );
     out.extend_from_slice(&v);
     out.extend_from_slice(&att);
     out.push(bundle.hops.len() as u8);
     for hop in &bundle.hops {
         out.extend_from_slice(&encode_hop(hop));
     }
+    encode_optional_webauthn(bundle.webauthn_assertion.as_ref(), &mut out);
     out
 }
 
@@ -177,34 +220,52 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<VoucherBundle, VoucherError> {
     for _ in 0..hop_count {
         hops.push(decode_hop_inner(&mut r)?);
     }
+    let webauthn_assertion = decode_optional_webauthn(&mut r)?;
     r.finish()?;
     Ok(VoucherBundle {
         voucher,
         attestation,
         hops,
+        webauthn_assertion,
     })
 }
 
 pub fn encode_close_statement(stmt: &CloseStatement) -> Vec<u8> {
-    let mut out = Vec::with_capacity(CloseStatement::WIRE_SIZE);
+    let extra = stmt
+        .webauthn_assertion
+        .as_ref()
+        .map(|w| 4 + w.authenticator_data.len() + w.client_data_json.len())
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(CloseStatement::WIRE_SIZE + 1 + extra);
     out.extend_from_slice(&stmt.signing_bytes());
     out.extend_from_slice(&stmt.sig);
-    debug_assert_eq!(out.len(), CloseStatement::WIRE_SIZE);
+    encode_optional_webauthn(stmt.webauthn_assertion.as_ref(), &mut out);
     out
 }
 
 pub fn decode_close_statement(bytes: &[u8]) -> Result<CloseStatement, VoucherError> {
     let mut r = ByteReader::new(bytes);
-    let stmt = CloseStatement {
-        chain_id: r.read_u64()?,
-        pocket_id: PocketId(r.read_array::<32>()?),
-        final_counter: r.read_u64()?,
-        final_cumulative_spent: r.read_u64()?,
-        closed_at: r.read_u64()?,
-        sig: r.read_array::<64>()?,
+    let chain_id = r.read_u64()?;
+    let pocket_id = PocketId(r.read_array::<32>()?);
+    let final_counter = r.read_u64()?;
+    let final_cumulative_spent = r.read_u64()?;
+    let closed_at = r.read_u64()?;
+    let sig = r.read_array::<64>()?;
+    let webauthn_assertion = if r.pos == r.buf.len() {
+        None
+    } else {
+        decode_optional_webauthn(&mut r)?
     };
     r.finish()?;
-    Ok(stmt)
+    Ok(CloseStatement {
+        chain_id,
+        pocket_id,
+        final_counter,
+        final_cumulative_spent,
+        closed_at,
+        sig,
+        webauthn_assertion,
+    })
 }
 
 /// Frames an arbitrary canonical payload as `PMV1 || len_u32_le || payload || sha256_tag[0..4]`.
