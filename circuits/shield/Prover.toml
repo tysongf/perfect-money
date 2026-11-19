@@ -1,0 +1,10 @@
+# Sample Vault Shield (money-in) proof input
+mint_amount = "600"
+out_commitment = "0x2448f00bd8c6d17683b8548e9d208768c6775bb92a4cc8a7cc2017fe60c5485c"
+tx_binding_hash = "0x7777666655554444"
+
+[out_note]
+value = "600"
+owner_pk_x = "0x2abb2c2819b2d7f10405dac13bdd5eb9921e727e03d784a36cf4bff58dd29984"
+owner_pk_y = "0x1da70e4fd29e92131aeae8b6801b0d5809c283a7fd7ce048f5af3b5470b0f037"
+blinding = "0x1111222233334444"

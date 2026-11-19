@@ -1,0 +1,15 @@
+[package]
+name = "ledger_core"
+version = "0.1.0"
+edition = "2024"
+description = "Chain-agnostic state-transition engine, Poseidon2 Merkle tree, Grumpkin keys, and Barretenberg verifier"
+
+[dependencies]
+acir = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0", features = ["bn254"] }
+acvm_blackbox_solver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0" }
+anyhow = "1.0"
+bn254_blackbox_solver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0" }
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.14"
+thiserror = "2.0"
+

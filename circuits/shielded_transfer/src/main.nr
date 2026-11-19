@@ -1,14 +1,10 @@
-mod types;
-mod crypto;
-mod merkle;
-
 use std::embedded_curve_ops::EmbeddedCurvePoint;
-use types::{MERKLE_DEPTH, Note};
-use crypto::{
+use common::types::{MERKLE_DEPTH, Note};
+use common::crypto::{
     assert_on_grumpkin, compute_note_commitment, compute_nullifier, derive_ak,
     derive_diversified_pk, derive_diversifier_x, derive_ivk, derive_nk,
 };
-use merkle::compute_merkle_root;
+use common::merkle::compute_merkle_root;
 
 fn main(
     // Public inputs
@@ -89,12 +85,12 @@ fn main(
 
 mod tests {
     use std::embedded_curve_ops::EmbeddedCurvePoint;
-    use crate::crypto::{
+    use common::crypto::{
         compute_note_commitment, compute_nullifier, derive_ak, derive_diversified_pk,
         derive_diversifier_x, derive_ivk, derive_nk, hash_merkle_node,
     };
     use crate::main;
-    use crate::types::{MERKLE_DEPTH, Note};
+    use common::types::{MERKLE_DEPTH, Note};
 
     global TEST_SENDER_ASK: Field = 123456789;
     global TEST_RECIP_ASK: Field = 987654321;

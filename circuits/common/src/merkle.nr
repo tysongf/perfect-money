@@ -22,3 +22,4 @@ pub fn compute_merkle_root(
 
     current
 }
+

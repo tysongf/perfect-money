@@ -368,5 +368,51 @@ mod tests {
             "expected broken IsZero w2 to be caught as unexpected survivor"
         );
     }
+
+    #[test]
+    fn test_public_input_inverse_not_falsely_flagged() {
+        // Public w0 = 7, private w1 = 1/7 with w0 * w1 - 1 == 0, plus private w2 = 7 with w2 - w0 == 0.
+        // Holding public inputs fixed in relational_random prevents falsely flagging (-w0, -w1).
+        let inv_expr = Expression {
+            mul_terms: vec![(FieldElement::one(), Witness(0), Witness(1))],
+            linear_combinations: vec![],
+            q_c: -FieldElement::one(),
+        };
+        let eq_expr = Expression {
+            mul_terms: vec![],
+            linear_combinations: vec![
+                (FieldElement::one(), Witness(2)),
+                (-FieldElement::one(), Witness(0)),
+            ],
+            q_c: FieldElement::zero(),
+        };
+        let circuit = Circuit {
+            function_name: "pub_inv".to_string(),
+            opcodes: vec![Opcode::AssertZero(inv_expr), Opcode::AssertZero(eq_expr)],
+            private_parameters: BTreeSet::from([Witness(1), Witness(2)]),
+            public_parameters: PublicInputs(BTreeSet::from([Witness(0)])),
+            return_values: PublicInputs::default(),
+            assert_messages: vec![],
+        };
+        let artifact = make_synthetic_artifact(circuit);
+        let w0 = FieldElement::from(7u64);
+        let w1 = w0.inverse();
+        let witness = WitnessMap::from(BTreeMap::from([
+            (Witness(0), w0),
+            (Witness(1), w1),
+            (Witness(2), w0),
+        ]));
+        let cfg = FuzzerConfig {
+            allow_dummy_unused: false,
+            seed: 42,
+            random_pairs: 500,
+        };
+        let report = run_fuzz_suite(&artifact, &witness, None, &cfg).unwrap();
+        assert!(
+            report.unexpected_survivors.is_empty(),
+            "expected zero unexpected survivors with public input fixed, got: {:?}",
+            report.unexpected_survivors
+        );
+    }
 }
 

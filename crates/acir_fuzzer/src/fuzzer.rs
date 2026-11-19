@@ -137,10 +137,17 @@ pub fn run_fuzz_suite(
         }
     }
 
+    // Hold public parameters and return values fixed during random multi-wire fuzzing so
+    // relational_random strictly checks private-witness soundness for fixed public statements.
     let active_wires: Vec<(Witness, FieldElement)> = all_wires
         .iter()
         .copied()
-        .filter(|(w, _)| !whitelist.contains(w) && !benign_inverses.contains(w))
+        .filter(|(w, _)| {
+            !whitelist.contains(w)
+                && !benign_inverses.contains(w)
+                && !circuit.public_parameters.0.contains(w)
+                && !circuit.return_values.0.contains(w)
+        })
         .collect();
 
     if active_wires.len() >= 2 && cfg.random_pairs > 0 {
@@ -357,19 +364,86 @@ fn build_targeted_relational_probes(
     }
 
     // 7. Off-curve output pubkey injection (y = 0 and y = y + 1 while value > 0)
-    if let (Some(&out0_v), Some(&out0_y)) = (
-        map.get("out_notes[0].value"),
-        map.get("out_notes[0].owner_pk_y"),
-    ) {
-        if !baseline[&out0_v].is_zero() {
-            let mut m0 = baseline.clone();
-            m0.insert(out0_y, FieldElement::zero());
-            probes.push(("off_curve_output_y_zero".to_string(), m0, vec![out0_y]));
+    push_off_curve_output_probes(
+        &mut probes,
+        map,
+        baseline,
+        "out_notes[0].value",
+        "out_notes[0].owner_pk_y",
+        "off_curve_output",
+    );
+    push_off_curve_output_probes(
+        &mut probes,
+        map,
+        baseline,
+        "out_note.value",
+        "out_note.owner_pk_y",
+        "off_curve_shield_output",
+    );
+    push_off_curve_output_probes(
+        &mut probes,
+        map,
+        baseline,
+        "change_note.value",
+        "change_note.owner_pk_y",
+        "off_curve_change_output",
+    );
 
-            let mut m1 = baseline.clone();
-            m1.insert(out0_y, m1[&out0_y] + FieldElement::one());
-            probes.push(("off_curve_output_y_plus_1".to_string(), m1, vec![out0_y]));
-        }
+    // 7b. Shield-specific relational probes
+    if let (Some(&mint_w), Some(&out_v)) = (map.get("mint_amount"), map.get("out_note.value")) {
+        let mut m1 = baseline.clone();
+        m1.insert(mint_w, m1[&mint_w] + FieldElement::one());
+        m1.insert(out_v, m1[&out_v] + FieldElement::one());
+        probes.push(("shield_paired_mint_plus_1".to_string(), m1, vec![mint_w, out_v]));
+
+        let mut m64 = baseline.clone();
+        m64.insert(mint_w, m64[&mint_w] + two_64);
+        m64.insert(out_v, m64[&out_v] + two_64);
+        probes.push(("shield_wrap_2_pow_64".to_string(), m64, vec![mint_w, out_v]));
+
+        let mut m0 = baseline.clone();
+        m0.insert(mint_w, FieldElement::zero());
+        m0.insert(out_v, FieldElement::zero());
+        probes.push(("shield_zero_mint_paired".to_string(), m0, vec![mint_w, out_v]));
+    }
+
+    // 7c. Unshield-specific relational probes
+    if let (Some(&in_v), Some(&burn_w), Some(&chg_v)) = (
+        map.get("in_note.value"),
+        map.get("burn_amount"),
+        map.get("change_note.value"),
+    ) {
+        let mut m_inf = baseline.clone();
+        m_inf.insert(in_v, m_inf[&in_v] + FieldElement::one());
+        m_inf.insert(burn_w, m_inf[&burn_w] + FieldElement::one());
+        probes.push((
+            "unshield_paired_value_inflation".to_string(),
+            m_inf,
+            vec![in_v, burn_w],
+        ));
+
+        let mut m_wrap = baseline.clone();
+        m_wrap.insert(burn_w, -FieldElement::one());
+        m_wrap.insert(chg_v, m_wrap[&chg_v] + FieldElement::one());
+        probes.push((
+            "unshield_field_wrap_burn_change".to_string(),
+            m_wrap,
+            vec![burn_w, chg_v],
+        ));
+
+        let mut m_64 = baseline.clone();
+        m_64.insert(in_v, m_64[&in_v] + two_64);
+        m_64.insert(burn_w, m_64[&burn_w] + two_64);
+        probes.push((
+            "unshield_wrap_2_pow_64_in_burn".to_string(),
+            m_64,
+            vec![in_v, burn_w],
+        ));
+    }
+    if let Some(&li) = map.get("in_leaf_index") {
+        let mut m = baseline.clone();
+        m.insert(li, m[&li] + two_32);
+        probes.push(("unshield_leaf_index_plus_2_pow_32".to_string(), m, vec![li]));
     }
 
     // 8. Zero tx_binding_hash paired with co-occurring AssertZero witness mutations (inverse check)
@@ -677,6 +751,27 @@ fn non_brillig_opcode_witnesses(op: &Opcode<FieldElement>) -> BTreeSet<Witness> 
         }
     }
     out
+}
+
+fn push_off_curve_output_probes(
+    probes: &mut Vec<(String, WitnessMap<FieldElement>, Vec<Witness>)>,
+    map: &BTreeMap<String, Witness>,
+    baseline: &WitnessMap<FieldElement>,
+    value_key: &str,
+    y_key: &str,
+    prefix: &str,
+) {
+    if let (Some(&val_w), Some(&y_w)) = (map.get(value_key), map.get(y_key)) {
+        if !baseline[&val_w].is_zero() {
+            let mut m0 = baseline.clone();
+            m0.insert(y_w, FieldElement::zero());
+            probes.push((format!("{prefix}_y_zero"), m0, vec![y_w]));
+
+            let mut m1 = baseline.clone();
+            m1.insert(y_w, m1[&y_w] + FieldElement::one());
+            probes.push((format!("{prefix}_y_plus_1"), m1, vec![y_w]));
+        }
+    }
 }
 
 fn format_wire(w: Witness, witness_to_label: &BTreeMap<Witness, String>) -> String {
