@@ -21,6 +21,7 @@ class BotContext:
     peg: PegStepResult
     throttle: ThrottleState
     config: Mapping[str, object]
+    round_open_true_prices: dict[str, float] = field(default_factory=dict)
 
 
 class ArbitrageurBot:
@@ -118,21 +119,33 @@ class WhistleblowerBot:
         agent_id: str = "whistleblower",
         dispute_bond_pm: float = 5000.0,
         deviation_threshold: float = 0.012,
+        use_epsilon_trigger: bool = True,
+        epsilon_multiplier: float = 1.05,
     ) -> None:
         self.agent_id = agent_id
         self.dispute_bond_pm = dispute_bond_pm
         self.deviation_threshold = deviation_threshold
+        self.use_epsilon_trigger = use_epsilon_trigger
+        self.epsilon_multiplier = epsilon_multiplier
         self.challenges_launched = 0
 
     def step(self, ctx: BotContext) -> None:
         rnd = ctx.oracle.active_round
         if rnd is None or rnd.phase != "CHALLENGE" or rnd.disputed:
             return
-        max_dev = max(
-            abs(rnd.p_med[a] - ctx.true_prices[a]) / ctx.true_prices[a]
-            for a in ctx.true_prices
-        )
-        if max_dev > self.deviation_threshold:
+        ref_prices = ctx.round_open_true_prices or ctx.true_prices
+        should_challenge = False
+        for asset, true_px in ref_prices.items():
+            rel_dev = abs(rnd.p_med[asset] - true_px) / true_px
+            limit = (
+                self.epsilon_multiplier * rnd.frozen_epsilons[asset]
+                if self.use_epsilon_trigger
+                else self.deviation_threshold
+            )
+            if rel_dev > limit:
+                should_challenge = True
+                break
+        if should_challenge:
             avail = ctx.system.agent_pm.get(self.agent_id, 0.0)
             if avail >= self.dispute_bond_pm:
                 ctx.system.agent_pm[self.agent_id] -= self.dispute_bond_pm
@@ -165,22 +178,29 @@ class OracleParticipantStrategy:
         self._round_quotes: dict[int, dict[str, tuple[dict[str, float], str]]] = {}
         self._traded_rounds: set[int] = set()
 
-    def _build_quote(self, node: OracleNode, ctx: BotContext, round_id: int) -> dict[str, float]:
+    def _build_quote(
+        self,
+        node: OracleNode,
+        ctx: BotContext,
+        round_id: int,
+        base_prices: Mapping[str, float] | None = None,
+    ) -> dict[str, float]:
+        src = base_prices if base_prices is not None else ctx.true_prices
         attack_active = self.attack_start_hour <= ctx.hour <= self.attack_end_hour
         if node.role == "cartel" and attack_active:
             if self.cartel_outlier_sybil_bias != 0.0 and node.node_id.endswith("_outlier"):
                 return {
                     a: px * (1.0 + self.cartel_outlier_sybil_bias)
-                    for a, px in ctx.true_prices.items()
+                    for a, px in src.items()
                 }
             return {
                 a: px * (1.0 + self.cartel_bias_by_asset.get(a, 0.0))
-                for a, px in ctx.true_prices.items()
+                for a, px in src.items()
             }
         # Honest / whistleblower reporters quote true prices with tiny observational jitter (< 0.04%)
         return {
             a: px * (1.0 + ctx.rng.uniform(-0.0004, 0.0004))
-            for a, px in ctx.true_prices.items()
+            for a, px in src.items()
         }
 
     def step(self, ctx: BotContext) -> None:
@@ -227,10 +247,11 @@ class OracleParticipantStrategy:
                     px_map, salt = quotes[node.node_id]
                     ctx.oracle.submit_reveal(node.node_id, px_map, salt)
         elif rnd.phase == "COURT":
+            court_ref = ctx.round_open_true_prices or ctx.true_prices
             for node in ctx.oracle.court_voter_nodes():
                 if node.node_id not in rnd.court_reveals:
-                    # 2-year locked court voters vote true market value if honest, biased if cartel
-                    px_map = self._build_quote(node, ctx, rnd.round_id)
+                    # 2-year locked court voters vote true market value at open_hour if honest, biased if cartel
+                    px_map = self._build_quote(node, ctx, rnd.round_id, base_prices=court_ref)
                     salt = f"court_{rnd.round_id}_{node.node_id}"
                     ctx.oracle.submit_court_vote(node.node_id, px_map, salt)
 

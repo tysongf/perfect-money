@@ -20,7 +20,7 @@ from .baselines import (
     WhaleBankRunBot,
     WhistleblowerBot,
 )
-from .oracle_market import OracleMarket, OracleNode
+from .oracle_market import OracleMarket, OracleNode, OracleRound
 from .peg_controller import (
     BasketSpec,
     DEFAULT_BASKET_WEIGHTS,
@@ -88,6 +88,8 @@ class EpisodeSummary:
     cumulative_slash_burned_pm: float
     total_oracle_rounds_finalized: int
     total_disputes: int
+    max_oracle_manipulation_error: float = 0.0
+    cartel_attacked: bool = False
 
 
 @dataclass
@@ -100,10 +102,23 @@ class EpisodeResult:
 class SimulationEnv:
     """Deterministic epoch environment enforcing 1h tick order and global accounting conservation."""
 
-    def __init__(self, config: Mapping[str, Any], seed: int = 42) -> None:
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        seed: int = 42,
+        *,
+        custom_agents: list[Any] | None = None,
+        covert_channel: Any | None = None,
+        replace_default_bots: bool = False,
+    ) -> None:
         self.config: dict[str, Any] = dict(config)
         self.seed = seed
         self.rng = random.Random(seed)
+        self.custom_agents: list[Any] = list(custom_agents or [])
+        self.covert_channel = covert_channel
+        self.replace_default_bots = replace_default_bots
+        self._cartel_attacked = False
+        self._max_oracle_manipulation_error = 0.0
         self.duration_hours = int(self.config.get("duration_hours", 504))
         self.shock_hour = int(self.config.get("shock_hour", 48))
         self.round_interval_hours = int(self.config.get("round_interval_hours", 6))
@@ -112,6 +127,7 @@ class SimulationEnv:
         genesis = dict(self.config.get("genesis_prices", DEFAULT_GENESIS_PRICES))
         self.basket = BasketSpec(weights=weights, genesis_prices=genesis)
         self.true_prices: dict[str, float] = dict(genesis)
+        self.price_history_by_hour: dict[int, dict[str, float]] = {0: dict(self.true_prices)}
 
         peg_cfg = self.config.get("peg_controller", {})
         self.peg_controller = PegController(
@@ -274,6 +290,8 @@ class SimulationEnv:
             WhistleblowerBot(
                 dispute_bond_pm=float(wb_cfg.get("dispute_bond_pm", 5000.0)),
                 deviation_threshold=float(wb_cfg.get("deviation_threshold", 0.012)),
+                use_epsilon_trigger=bool(wb_cfg.get("use_epsilon_trigger", True)),
+                epsilon_multiplier=float(wb_cfg.get("epsilon_multiplier", 1.05)),
             )
             if bool(wb_cfg.get("enabled", True))
             else None
@@ -314,15 +332,32 @@ class SimulationEnv:
 
         self.k_pfc = float(self.config.get("k_pfc", 1.5))
 
+    def round_open_true_prices(self, rnd: OracleRound | None = None) -> dict[str, float]:
+        if rnd is None:
+            return dict(self.true_prices)
+        return dict(self.price_history_by_hour.get(rnd.open_hour, self.true_prices))
+
     def _cartel_wealth(self, r_px: float) -> float:
         stake = sum(n.stake_pm for n in self.oracle.nodes.values() if n.role == "cartel")
-        liquid_pm = sum(
-            self.system.agent_pm.get(nid, 0.0)
-            for nid, n in self.oracle.nodes.items()
-            if n.role == "cartel"
-        ) + self.system.agent_pm.get("cartel_trader", 0.0)
+        pending = (
+            self.system.pending_dispute_bonds_pm
+            if self.oracle.active_round is not None
+            and self.oracle.active_round.disputed
+            and self.oracle.active_round.challenger_id in ("cartel", "cartel_trader")
+            else 0.0
+        )
+        liquid_pm = (
+            sum(
+                self.system.agent_pm.get(nid, 0.0)
+                for nid, n in self.oracle.nodes.items()
+                if n.role == "cartel"
+            )
+            + self.system.agent_pm.get("cartel_trader", 0.0)
+            + self.system.agent_pm.get("cartel", 0.0)
+            + pending
+        )
         num = self.system.agent_numeraire.get("cartel_trader", 0.0)
-        return (stake + liquid_pm) * r_px + num
+        return (stake + liquid_pm) + (num / max(1e-9, r_px))
 
     def _whistleblower_wealth(self, r_px: float) -> float:
         stake = sum(n.stake_pm for n in self.oracle.nodes.values() if n.role == "whistleblower")
@@ -343,7 +378,7 @@ class SimulationEnv:
             + pending
         )
         num = self.system.agent_numeraire.get("whistleblower", 0.0)
-        return (stake + liquid_pm) * r_px + num
+        return (stake + liquid_pm) + (num / max(1e-9, r_px))
 
     def _apply_scheduled_shocks(self, hour: int) -> None:
         for shock in self.config.get("shocks", []):
@@ -367,11 +402,27 @@ class SimulationEnv:
     def _settle_oracle_events(self, throttle: Any, hour: int) -> None:
         res, no_rev, _ = self.oracle.advance(hour, throttle, self.system.oracle_fee_pool_pm)
         if no_rev["total_slashed_pm"] > 0.0:
+            if self.oracle.active_round is not None and any(
+                self.oracle.nodes.get(nid) is not None and self.oracle.nodes[nid].role == "cartel"
+                for nid in self.oracle.active_round.no_reveal_slashes
+            ):
+                self._cartel_attacked = True
             self.system.cumulative_slash_burned_pm += no_rev["burned_pm"]
             self.system.circulating_pm_supply -= no_rev["burned_pm"]
             self.system.insurance_reserve_pm += no_rev["insurance_pm"]
 
         if res is not None:
+            i_or_fin = self.basket.index(res.finalized_prices)
+            i_tr_ref = self.basket.index(self.round_open_true_prices(self.oracle.active_round))
+            self._max_oracle_manipulation_error = max(
+                self._max_oracle_manipulation_error,
+                abs(i_or_fin - i_tr_ref) / max(1e-9, i_tr_ref),
+            )
+            if any(
+                self.oracle.nodes.get(nid) is not None and self.oracle.nodes[nid].role == "cartel"
+                for nid in res.node_slashes
+            ):
+                self._cartel_attacked = True
             paid_rewards = sum(res.reward_payouts.values())
             self.system.oracle_fee_pool_pm = (
                 self.system.oracle_fee_pool_pm + res.bond_fee_pool_pm - paid_rewards
@@ -391,6 +442,293 @@ class SimulationEnv:
             self.system.circulating_pm_supply -= res.burned_pm
             self.system.insurance_reserve_pm += res.insurance_pm
 
+    def transfer_pm(self, sender_id: str, recipient_id: str, amount: float) -> float:
+        """Conservation-preserving transfer of liquid PM between two accounts."""
+        self.system.ensure_agent(sender_id)
+        self.system.ensure_agent(recipient_id)
+        amt = min(max(0.0, float(amount)), self.system.agent_pm.get(sender_id, 0.0))
+        if amt <= 0.0:
+            return 0.0
+        self.system.agent_pm[sender_id] -= amt
+        self.system.agent_pm[recipient_id] += amt
+        return amt
+
+    def challenge_oracle_round(self, challenger_id: str, bond_pm: float, hour: int) -> bool:
+        """Posts dispute bond and escalates current CHALLENGE round to 48h COURT."""
+        rnd = self.oracle.active_round
+        if rnd is None or rnd.phase != "CHALLENGE" or rnd.disputed:
+            return False
+        bond = max(float(bond_pm), self.oracle.dispute_bond_min_pm)
+        avail = self.system.agent_pm.get(challenger_id, 0.0)
+        if avail + 1e-12 < bond:
+            return False
+        self.system.agent_pm[challenger_id] = max(0.0, avail - bond)
+        self.system.pending_dispute_bonds_pm += bond
+        self.oracle.challenge_round(challenger_id, bond, hour)
+        return True
+
+    def lock_oracle_stake(self, agent_id: str, node_id: str, amount: float) -> float:
+        """Locks liquid PM from `agent_id` into an existing oracle node's stake."""
+        node = self.oracle.nodes.get(node_id)
+        if node is None:
+            return 0.0
+        self.system.ensure_agent(agent_id)
+        add = min(max(0.0, float(amount)), self.system.agent_pm.get(agent_id, 0.0))
+        if add <= 0.0:
+            return 0.0
+        self.system.agent_pm[agent_id] -= add
+        node.stake_pm += add
+        return add
+
+    def build_agent_observation(
+        self,
+        agent: Any,
+        hour: int,
+        peg_res: PegStepResult,
+        throttle: ThrottleState,
+    ) -> dict[str, Any]:
+        """Constructs strict JSON-serializable state observation for a pluggable Step 2 agent."""
+        rnd = self.oracle.active_round
+        owned_nodes = sorted(getattr(agent, "owned_node_ids", ()))
+        owned_accts = sorted(getattr(agent, "owned_accounts", (agent.agent_id,)))
+        total_locked = self.oracle.total_locked_stake()
+        cartel_stake = sum(n.stake_pm for n in self.oracle.nodes.values() if n.role == "cartel")
+        round_info = None
+        if rnd is not None:
+            round_info = {
+                "round_id": rnd.round_id,
+                "open_hour": rnd.open_hour,
+                "phase": rnd.phase,
+                "phase_end_hour": rnd.phase_end_hour,
+                "frozen_epsilons": dict(rnd.frozen_epsilons),
+                "open_true_prices": self.round_open_true_prices(rnd),
+                "p_med": dict(rnd.p_med),
+                "disputed": rnd.disputed,
+                "is_drastic": rnd.is_drastic,
+                "committed_nodes": sorted(rnd.commits.keys()),
+                "revealed_nodes": sorted(rnd.reveals.keys()),
+                "court_voted_nodes": sorted(rnd.court_reveals.keys()),
+            }
+        return {
+            "hour": hour,
+            "duration_hours": self.duration_hours,
+            "shock_hour": self.shock_hour,
+            "true_prices": dict(self.true_prices),
+            "last_finalized_prices": dict(self.oracle.last_finalized_prices),
+            "branch_prices": {k: b.price for k, b in self.system.branches.items()},
+            "i_oracle": peg_res.i_oracle,
+            "r_price": peg_res.r_price,
+            "m_spot": peg_res.m_spot,
+            "e_spot": peg_res.e_spot,
+            "min_borrow_rate_apr": peg_res.min_borrow_rate_apr,
+            "redemption_fee": self.system.current_redemption_fee(hour),
+            "circulating_pm_supply": self.system.circulating_pm_supply,
+            "active_debt_pm": self.system.active_vault_debt(),
+            "amm_pm_reserve": self.system.amm.pm_reserve,
+            "amm_numeraire_reserve": self.system.amm.numeraire_reserve,
+            "amm_fee_rate": self.system.amm.fee_rate,
+            "throttle": {
+                "locked_pm": throttle.locked_pm,
+                "max_epoch_delta": throttle.max_epoch_delta,
+                "challenge_hours": throttle.challenge_hours,
+                "staker_fee_share": throttle.staker_fee_share,
+                "coc_pfc_ratio": throttle.coc_pfc_ratio,
+                "deficit_frac": throttle.deficit_frac,
+            },
+            "oracle_round": round_info,
+            "dispute_bond_min_pm": self.oracle.dispute_bond_min_pm,
+            "total_locked_stake_pm": total_locked,
+            "cartel_stake_pm": cartel_stake,
+            "balances_pm": {a: self.system.agent_pm.get(a, 0.0) for a in owned_accts},
+            "balances_numeraire": {a: self.system.agent_numeraire.get(a, 0.0) for a in owned_accts},
+            "node_stakes": {
+                nid: {
+                    "stake_pm": self.oracle.nodes[nid].stake_pm,
+                    "role": self.oracle.nodes[nid].role,
+                    "jailed": self.oracle.nodes[nid].jailed,
+                }
+                for nid in owned_nodes
+                if nid in self.oracle.nodes
+            },
+        }
+
+    def apply_agent_action(
+        self,
+        agent: Any,
+        action: Any,
+        hour: int,
+        peg_res: PegStepResult,
+        throttle: ThrottleState,
+    ) -> bool:
+        """Executes one validated AgentAction against simulator state with ownership checks."""
+        atype = action.action_type
+        params = action.params
+        if atype == "NOOP":
+            return True
+
+        owned_nodes = set(getattr(agent, "owned_node_ids", ()))
+        owned_accts = set(getattr(agent, "owned_accounts", (agent.agent_id,)))
+        sender = str(params.get("account_id", agent.agent_id))
+        if sender not in owned_accts and atype not in (
+            "ORACLE_COMMIT",
+            "ORACLE_REVEAL",
+            "ORACLE_COURT_VOTE",
+            "COVERT_SEND",
+        ):
+            return False
+
+        is_cartel_agent = getattr(agent, "role", "") == "cartel"
+
+        if atype == "ORACLE_COMMIT":
+            nid = str(params["node_id"])
+            if nid not in owned_nodes:
+                return False
+            rnd = self.oracle.active_round
+            if rnd is None or rnd.phase != "COMMIT" or nid in rnd.commits:
+                return False
+            prices = {a: float(params["prices"][a]) for a in self.true_prices}
+            salt = str(params["salt"])
+            self.oracle.submit_commit(nid, prices, salt)
+            if nid in rnd.commits:
+                ref_px = self.round_open_true_prices(rnd)
+                if is_cartel_agent and any(
+                    abs(prices[a] - ref_px[a]) / ref_px[a] > 0.5 * rnd.frozen_epsilons[a]
+                    for a in self.true_prices
+                ):
+                    self._cartel_attacked = True
+                return True
+            return False
+
+        if atype == "ORACLE_REVEAL":
+            nid = str(params["node_id"])
+            if nid not in owned_nodes:
+                return False
+            rnd = self.oracle.active_round
+            if rnd is None or rnd.phase != "REVEAL" or nid in rnd.reveals:
+                return False
+            prices = {a: float(params["prices"][a]) for a in self.true_prices}
+            salt = str(params["salt"])
+            ok = self.oracle.submit_reveal(nid, prices, salt)
+            ref_px = self.round_open_true_prices(rnd)
+            if ok and is_cartel_agent and any(
+                abs(prices[a] - ref_px[a]) / ref_px[a] > 0.5 * rnd.frozen_epsilons[a]
+                for a in self.true_prices
+            ):
+                self._cartel_attacked = True
+            return ok
+
+        if atype == "ORACLE_COURT_VOTE":
+            nid = str(params["node_id"])
+            if nid not in owned_nodes:
+                return False
+            rnd = self.oracle.active_round
+            if rnd is None or rnd.phase != "COURT" or nid in rnd.court_reveals:
+                return False
+            prices = {a: float(params["prices"][a]) for a in self.true_prices}
+            salt = str(params["salt"])
+            self.oracle.submit_court_vote(nid, prices, salt)
+            ref_px = self.round_open_true_prices(rnd)
+            if (
+                nid in rnd.court_reveals
+                and is_cartel_agent
+                and any(
+                    abs(prices[a] - ref_px[a]) / ref_px[a] > 0.5 * rnd.frozen_epsilons[a]
+                    for a in self.true_prices
+                )
+            ):
+                self._cartel_attacked = True
+            return nid in rnd.court_reveals
+
+        if atype == "ORACLE_CHALLENGE":
+            bond = float(params.get("bond_pm", self.oracle.dispute_bond_min_pm))
+            if is_cartel_agent:
+                self._cartel_attacked = True
+            return self.challenge_oracle_round(sender, bond, hour)
+
+        if atype == "AMM_SWAP_PM_TO_NUM":
+            amt = min(float(params["pm_amount"]), self.system.agent_pm.get(sender, 0.0))
+            if amt <= 1.0:
+                return False
+            self.system.swap_pm_for_numeraire(sender, amt)
+            if is_cartel_agent:
+                self._cartel_attacked = True
+            return True
+
+        if atype == "AMM_SWAP_NUM_TO_PM":
+            amt = min(float(params["numeraire_amount"]), self.system.agent_numeraire.get(sender, 0.0))
+            if amt <= 1.0:
+                return False
+            self.system.swap_numeraire_for_pm(sender, amt)
+            if is_cartel_agent:
+                self._cartel_attacked = True
+            return True
+
+        if atype == "REDEEM_PM":
+            amt = min(
+                float(params["pm_amount"]),
+                self.system.agent_pm.get(sender, 0.0),
+                self.system.active_vault_debt(),
+            )
+            if amt <= 1.0:
+                return False
+            receipt = self.system.redeem_pm(sender, amt, peg_res.r_price, hour, convert_to_numeraire=True)
+            return receipt.pm_redeemed > 0.0
+
+        if atype == "MINT_AND_SELL":
+            vid = str(params["vault_id"])
+            vault = self.system.vaults.get(vid)
+            if vault is None or vault.owner not in owned_accts:
+                return False
+            branch = self.system.branches[vault.branch]
+            max_debt = (vault.collateral_qty * branch.price) / (branch.mint_mcr * peg_res.r_price * 1.02)
+            headroom = max(0.0, max_debt - vault.debt_pm)
+            mint_amt = min(float(params["mint_pm"]), headroom)
+            if mint_amt <= 1.0:
+                return False
+            rate = max(float(params.get("borrow_rate_apr", 0.06)), peg_res.min_borrow_rate_apr)
+            self.system.open_or_mint_vault(
+                vault.owner,
+                vault.branch,
+                0.0,
+                mint_amt,
+                rate,
+                peg_res.r_price,
+                peg_res.min_borrow_rate_apr,
+                vault_id=vid,
+            )
+            self.system.swap_pm_for_numeraire(vault.owner, mint_amt)
+            return True
+
+        if atype == "LOCK_STAKE":
+            nid = str(params["node_id"])
+            if nid not in owned_nodes:
+                return False
+            return self.lock_oracle_stake(sender, nid, float(params["pm_amount"])) > 0.0
+
+        if atype == "COVERT_SEND":
+            if self.covert_channel is None:
+                return False
+            rnd = self.oracle.active_round
+            rid = rnd.round_id if rnd is not None else None
+            self.covert_channel.send(
+                hour=hour,
+                round_id=rid,
+                sender=agent.agent_id,
+                recipients=list(params["recipients"]),
+                msg_type=str(params["msg_type"]),
+                payload=dict(params.get("payload", {})),
+            )
+            return True
+
+        if atype == "PAY_BRIBE":
+            recipient = str(params["recipient_id"])
+            paid = self.transfer_pm(sender, recipient, float(params["pm_amount"]))
+            if paid > 0.0 and is_cartel_agent:
+                self._cartel_attacked = True
+            return paid > 0.0
+
+        return False
+
     def run(self) -> EpisodeResult:
         cartel_init = self._cartel_wealth(1.0)
         wb_init = self._whistleblower_wealth(1.0)
@@ -401,6 +739,7 @@ class SimulationEnv:
             self._apply_scheduled_shocks(hour)
             if hour > 0:
                 self._apply_background_noise()
+            self.price_history_by_hour[hour] = dict(self.true_prices)
 
             # Compute current security throttle snapshot
             locked_pm = self.oracle.total_locked_stake()
@@ -444,17 +783,40 @@ class SimulationEnv:
                 peg=peg_res,
                 throttle=throttle,
                 config=self.config,
+                round_open_true_prices=self.round_open_true_prices(self.oracle.active_round),
             )
 
-            self.oracle_strategy.step(ctx)
-            if self.whistleblower_bot is not None:
-                self.whistleblower_bot.step(ctx)
-            if self.whale_bot is not None:
-                self.whale_bot.step(ctx)
-            if self.hostile_bot is not None:
-                self.hostile_bot.step(ctx)
-            self.dynamic_staker.step(ctx)
-            self.arb_bot.step(ctx)
+            if self.custom_agents and self.replace_default_bots:
+                for agent in self.custom_agents:
+                    obs = self.build_agent_observation(agent, hour, peg_res, throttle)
+                    inbox = (
+                        self.covert_channel.poll(agent.agent_id)
+                        if self.covert_channel is not None
+                        else []
+                    )
+                    actions = agent.decide(obs, inbox, self.rng)
+                    for act in actions:
+                        self.apply_agent_action(agent, act, hour, peg_res, throttle)
+                self.dynamic_staker.step(ctx)
+            else:
+                self.oracle_strategy.step(ctx)
+                if self.whistleblower_bot is not None:
+                    self.whistleblower_bot.step(ctx)
+                if self.whale_bot is not None:
+                    self.whale_bot.step(ctx)
+                if self.hostile_bot is not None:
+                    self.hostile_bot.step(ctx)
+                self.dynamic_staker.step(ctx)
+                self.arb_bot.step(ctx)
+                for agent in self.custom_agents:
+                    obs = self.build_agent_observation(agent, hour, peg_res, throttle)
+                    inbox = (
+                        self.covert_channel.poll(agent.agent_id)
+                        if self.covert_channel is not None
+                        else []
+                    )
+                    for act in agent.decide(obs, inbox, self.rng):
+                        self.apply_agent_action(agent, act, hour, peg_res, throttle)
 
             # Recompute throttle & assert strict conservation invariants every hour
             locked_after = self.oracle.total_locked_stake()
@@ -561,6 +923,8 @@ class SimulationEnv:
             cumulative_slash_burned_pm=self.system.cumulative_slash_burned_pm,
             total_oracle_rounds_finalized=len(self.oracle.history),
             total_disputes=sum(1 for h in self.oracle.history if h.was_disputed),
+            max_oracle_manipulation_error=self._max_oracle_manipulation_error,
+            cartel_attacked=self._cartel_attacked,
         )
         return EpisodeResult(summary=summary, telemetry=telemetry, config=self.config)
 

@@ -111,7 +111,8 @@ All oracle reporters and 48-hour dispute escalation voters lock **unshielded Per
 3. **Optimistic Challenge Window (`T_challenge`):**
    * Routine shifts (`|P_med(t) - P_med(t-1)| / P_med(t-1) <= 0.02`): `2 hours` (or extended under low-stake throttling).
    * Drastic shifts (`> 2%`): minimum `48 hours`.
-   * **Anyone** can post a dispute bond `B_dispute` in PM to escalate to the time-locked (2+ year lockup) PM holder court using blind commit-reveal.
+   * **Anyone** can post a dispute bond `B_dispute` in PM to escalate to the time-locked (2+ year lockup) PM holder court using blind commit-reveal. Honest whistleblowers trigger escalation whenever any asset's `|P_med - P_true| / P_true > 1.05 * epsilon` (coupling the challenge trigger to pre-round frozen `epsilon` prevents stealth "boiling-frog" creep from falling between `epsilon` and a static dispute threshold to slash honest minorities).
+   * **Timestamp-Anchored Dispute Adjudication:** Whistleblower challenge evaluation and 48-hour Dispute Court votes are timestamp-anchored to the round's Commit timestamp (`open_hour`): court voters adjudicate the true market price at `open_hour` rather than future spot prices arriving during `CHALLENGE`/`COURT`, preventing mid-round spot volatility (TOCTOU griefing) from overturning valid pre-shock commits and slashing honest reporters.
 4. **Finalization:**
    * Upheld `P*` updates `I(t)` (subject to epoch delta clamping), rewards coherent reporters, and slashes outliers.
 
@@ -181,15 +182,21 @@ perfect-money/
 │   │   ├── baselines.py                # Deterministic arbitrage, staker, cartel, whistleblower & bank-run bots
 │   │   ├── phase1_bridge.py            # Subprocess bridge verifying simulated mint/burn deltas via Noir circuits
 │   │   └── environment.py              # 1-hour deterministic epoch clock, conservation & CoC/PfC telemetry
-│   ├── red_team_agents/                # (Step 2) LLM-driven adversarial swarm
+│   ├── red_team_agents/                # Step 2: adaptive + LLM-pluggable adversarial swarm
+│   │   ├── __init__.py
+│   │   ├── covert_channel.py           # Private off-band cartel collusion & bribe-defection bus
+│   │   ├── base_agent.py               # Strict JSON Observation->Action contract & pluggable LLM client
+│   │   ├── personas.py                 # Cartel, Whistleblower, GreedyWhale, RetailHerd, HostileState, Arb
+│   │   └── runner.py                   # 120-episode randomized audit matrix & p50/p95/worst report
 │   ├── scenarios/
 │   │   ├── 01_oracle_cartel_bribe.yaml
 │   │   ├── 02_commodity_supply_shock.yaml
 │   │   ├── 03_whale_bank_run.yaml
 │   │   └── 04_hostile_state_short.yaml
-│   └── tests/                          # Unit, ablation, conservation, scenario & Phase 1 bridge tests
+│   └── tests/                          # Unit, ablation, conservation, scenario, swarm & Phase 1 bridge tests
 └── scripts/
-    └── run_sim_step1.sh
+    ├── run_sim_step1.sh
+    └── run_red_team_suite.sh
 ```
 
 ---
