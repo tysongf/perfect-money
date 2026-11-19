@@ -54,33 +54,37 @@ Where:
 * **Baseline Epoch Basket Delta:** Routine finalized oracle update clamped to `+/- 5%` (`max_epoch_delta = 0.05`) unless confirmed by a full 48-hour dispute escalation round — and further clamped tighter by **Low-Stake Auto-Throttling** (Section 4.3).
 * **PID Rate Adjustment Clamp:** Per-epoch target rate adjustment `u(t)` capped at `+/- 1.5%` (`u_max = 0.015`).
 
-### 2.4 Endogenous Vault Engine: Hard Redemptions + PID-Smoothed Target
+### 2.4 Endogenous Vault Engine: Hard Redemptions + Patched Decoupled Target
 
 Rather than relying on a purely floating RAI-style peg (which suffers weak secondary-market price floors) or freezeable tokenized T-bills, PM uses:
 
-1. **100% Censorship-Resistant Isolated Collateral Branches:** Only permissionless, non-freezeable crypto collateral (e.g., ETH, trust-minimized BTC). No custodial RWAs or fiat-backed stablecoins. Each collateral type lives in an isolated branch with its own minimum collateral ratio (e.g., `150%`+), debt tracking, and Stability Pool so a crash in one asset cannot poison other branches.
+1. **100% Censorship-Resistant Isolated Collateral Branches:** Only permissionless, non-freezeable crypto collateral lives in isolated branches with distinct minimum collateral ratios (MCR) and liquidation ratios (`liq_CR`), so a crash in one asset cannot poison other branches:
+   * **ETH Branch:** `150%` mint MCR / `115%` liquidation CR (`5%` liquidation discount)
+   * **BTC Branch:** `150%` mint MCR / `115%` liquidation CR (`5%` liquidation discount)
+   * **SOL / Alt-Crypto Branch:** `175%` mint MCR / `125%` liquidation CR (`8%` liquidation discount)
 2. **Borrower-Set Interest Rates & Liquity-v2 Hard Redemptions:**
    * Vault borrowers select their annual PM borrow rate `r_vault`.
-   * Redemption target `R(t)` tracks the basket index `I(t)` smoothed through a discrete PID controller so flash market noise or bounded oracle ticks do not cause instant liquidation cascades.
-   * **Arbitrage Floor:** Anyone can buy PM on the open market whenever `M(t) < R(t)` and **hard-redeem** 1 PM for `R(t)` numeraire-equivalent worth of collateral, starting with vaults paying the **lowest** interest rates (ordered across branches by branch risk / unbackedness).
+   * Redemption target `R(t)` smoothly tracks the finalized basket index `I(t)` through a **monotonically clamped tracking controller** (`u_max = 1.5%` per 12h epoch = `3.0%/day` max), preventing flash oracle noise from triggering instant liquidation cascades.
+   * **AMM-Spoofing Fix (Decoupled `R(t)` vs. Spot `M(t)`):** `R(t)` is intentionally **decoupled from spoofing-prone AMM spot price `M(t)`**. Driving `R(t)` directly from `(I(t) - M(t)) / I(t)` while offering hard redemptions creates an exploit where an attacker dumps PM on a thin AMM, pushes `R(t) > I(t)`, and drains honest borrowers' collateral at an inflated redemption payout. Instead, `R(t)` tracks `I(t)` only (`e_target(t) = (I(t) - R(t)) / I(t)`), while spot error `e_spot(t) = (I(t) - M(t)) / I(t)` feeds a **bounded PID minimum borrow-rate floor** (`0.5%`–`25.0%` APR).
+   * **Arbitrage Floor & Dynamic Redemption Fee:** Anyone can buy PM whenever `M(t) < R(t) * (1 - f_redeem)` and **hard-redeem** `1 PM` for `R(t) * (1 - f_redeem)` numeraire-equivalent worth of collateral, targeting lowest-interest vaults first. `f_redeem = min(0.05, 0.005 + base_rate)` (`0.5%` floor, `5.0%` cap, `6h` decay half-life), split **50%** to the redeemed vault owner (offsetting adverse selection) and **50%** to the Protocol Insurance Reserve.
    * **Arbitrage Ceiling:** Whenever `M(t) > R(t)`, borrowers mint fresh PM against collateral at `R(t)` and sell into the spot market for risk-free profit.
-3. **PID Dampening Controller:**
+3. **Decoupled Target Tracker & Spot Borrow-Rate PID:**
 
 ```text
-Peg Error at epoch t:
-  e(t) = (I(t) - M(t)) / I(t)
+1. Redemption Target Tracking (immune to AMM spot spoofing):
+  e_target(t) = (I(t) - R(t)) / I(t)
+  u_r(t)      = clamp( K_track * e_target(t), -u_max, +u_max )
+  R(t+1)      = clamp_between( R(t), I(t), R(t) * (1 + u_r(t) * dt) )
 
-Discrete PID Controller Output (Redemption Target Drift Adjustment):
-  If |e(t)| < deadband (0.0025):
-      u(t) = 0.0
+2. Spot Peg Error -> Bounded Minimum Borrow-Rate Floor:
+  e_spot(t) = (I(t) - M(t)) / I(t)
+  If |e_spot(t)| < deadband (0.0025):
+      min_borrow_rate_apr(t) = min_rate_base (0.005)
   Else:
-      P(t)      = K_p * e(t)
-      I_term(t) = clamp( I_term(t-1) + K_i * e(t) * dt, -I_max, +I_max )
-      D(t)      = K_d * (e(t) - e(t-1)) / dt
-      u(t)      = clamp( P(t) + I_term(t) + D(t), -u_max, +u_max )
-
-Target Redemption Price Update:
-  R(t+1) = R(t) * (1 + u(t) * dt)
+      P(t)      = K_p * e_spot(t)
+      I_term(t) = clamp( I_term(t-1) + K_i * e_spot(t) * dt, -I_max, +I_max )
+      D(t)      = K_d * (e_spot(t) - e_spot(t-1)) / dt
+      min_borrow_rate_apr(t) = clamp( min_rate_base + P(t) + I_term(t) + D(t), 0.005, 0.25 )
 ```
 
 ### 2.5 Hybrid A3 Bad-Debt Absorption (Single-Token, Zero MKR Equity)
@@ -141,10 +145,19 @@ Slashing & Reward Function:
 
 ### 3.4 Stacked Security Defenses (`CoC >= 3.0 * PfC`)
 
-To guarantee `Cost of Corruption >= 3.0 * Profit from Corruption` in a single-token lockup system:
+To guarantee `Cost of Corruption >= 3.0 * Profit from Corruption` in a single-token lockup system using conservative majority-cartel cost `CoC_51 = 0.51 * Total_Locked_PM` and observable TVL + external-leverage proxy `PfC`:
 
-1. **Dynamic Yield Routing:** Baseline `~25%` of vault borrow interest flows to active oracle reporters and 2+ year locked court stakers. Whenever `Total_Locked_PM < 3.0 * PfC`, borrow fee share routed to stakers scales upward dynamically (e.g., up to `40%`) to pull fresh PM lockups in.
-2. **Low-Stake Auto-Throttling:** Whenever locked stake falls below `3.0 * PfC`, `max_epoch_delta` automatically tightens (from `5.0%` down toward `0.5%`) and the challenge window widens up to `7 days`, shrinking extractable `PfC` while stake recovers.
+```text
+Observable Exposure & Closed-Form Auto-Throttle:
+  Exposure(t)        = AMM_Liquidity + Total_PM_Supply
+  K_pfc              = 1.5   (prices in off-chain perp / DEX leverage)
+  PfC_unthrottled(t) = K_pfc * 0.05 * Exposure(t)
+  max_epoch_delta(t) = clamp( CoC_51 / (3.0 * K_pfc * Exposure(t)), 0.005, 0.05 )
+  PfC_effective(t)   = K_pfc * max_epoch_delta(t) * Exposure(t)
+```
+
+1. **Dynamic Yield Routing:** Baseline `~25%` of vault borrow interest flows to active oracle reporters and 2+ year locked court stakers (`65%` Stability Pool, `10%` Insurance Reserve). Whenever `CoC_51 < 3.0 * PfC_unthrottled`, the staker share dynamically scales upward to **`40%`** (drawing from Stability Pool `65% -> 50%` while holding Insurance Reserve fixed at `10%`) to pull fresh PM lockups in.
+2. **Low-Stake Auto-Throttling:** Whenever locked stake falls below `3.0 * PfC_unthrottled`, `max_epoch_delta` tightens smoothly per the closed-form formula above (from `5.0%` down toward `0.5%`) and the challenge window widens proportionally from `2 hours` up to `168 hours` (`7 days`), shrinking extractable `PfC_effective` while stake recovers.
 3. **Credible Fork Backstop:** Because court lockups span `2+ years` and drastic updates trigger a `48h+` delay, a 51% cartel pushing a blatantly fabricated price cannot withdraw stake before the community coordinates a social/client fork that burns `100%` of the cartel's locked PM on the canonical branch.
 
 ---
@@ -156,24 +169,27 @@ perfect-money/
 ├── specs/
 │   ├── phase1_utxo_spec.md
 │   └── phase2_peg_oracle_spec.md
+├── crates/ledger_core/src/bin/
+│   └── verify_supply_deltas.rs         # Phase 1 real Noir shield/unshield bridge verifier
 ├── sim/
+│   ├── requirements.txt                # pyyaml, pytest
 │   ├── engine/
-│   │   ├── peg_controller.py           # Geometric basket + PID + auto-throttle clamps
-│   │   ├── oracle_market.py            # Commit-reveal, lagged-EWMA slashing & dispute court
-│   │   ├── amm_and_vaults.py           # Isolated collateral vaults, Stability Pools, Insurance Reserve, spot AMM
-│   │   └── environment.py              # Deterministic epoch clock, CoC/PfC monitor & telemetry
-│   ├── red_team_agents/
-│   │   ├── base_agent.py               # Strict JSON action schema
-│   │   ├── personas.py                 # Greedy Whale, Oracle Cartel, Whistleblower, Retail Herd, Hostile State, Arb
-│   │   ├── covert_channel.py           # Private collusion channel for cartel coordination
-│   │   └── runner.py                   # Multi-episode adversarial runner & invariant auditor
-│   └── scenarios/
-│       ├── 01_oracle_cartel_bribe.yaml
-│       ├── 02_commodity_supply_shock.yaml
-│       ├── 03_whale_bank_run.yaml
-│       └── 04_hostile_state_short.yaml
+│   │   ├── __init__.py
+│   │   ├── peg_controller.py           # Geometric basket + decoupled R(t) + spot rate PID + auto-throttle
+│   │   ├── oracle_market.py            # Commit-reveal, lagged-EWMA slashing & 48h dispute court
+│   │   ├── amm_and_vaults.py           # ETH/BTC/SOL isolated vaults, Stability Pools, Insurance Reserve, spot AMM
+│   │   ├── baselines.py                # Deterministic arbitrage, staker, cartel, whistleblower & bank-run bots
+│   │   ├── phase1_bridge.py            # Subprocess bridge verifying simulated mint/burn deltas via Noir circuits
+│   │   └── environment.py              # 1-hour deterministic epoch clock, conservation & CoC/PfC telemetry
+│   ├── red_team_agents/                # (Step 2) LLM-driven adversarial swarm
+│   ├── scenarios/
+│   │   ├── 01_oracle_cartel_bribe.yaml
+│   │   ├── 02_commodity_supply_shock.yaml
+│   │   ├── 03_whale_bank_run.yaml
+│   │   └── 04_hostile_state_short.yaml
+│   └── tests/                          # Unit, ablation, conservation, scenario & Phase 1 bridge tests
 └── scripts/
-    └── run_red_team_suite.sh
+    └── run_sim_step1.sh
 ```
 
 ---

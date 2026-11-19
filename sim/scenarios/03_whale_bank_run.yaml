@@ -1,0 +1,113 @@
+name: "03_whale_bank_run"
+description: "30% PM supply bank-run dump + simultaneous -50% SOL single-branch crash testing Hybrid A3 isolation"
+duration_hours: 504
+shock_hour: 48
+round_interval_hours: 6
+k_pfc: 1.5
+basket_hourly_noise_sigma: 0.0003
+
+peg_controller:
+  mode: "patched_decoupled"
+
+amm:
+  pm_reserve: 250000.0
+  numeraire_reserve: 250000.0
+  fee_rate: 0.003
+
+initial_vaults:
+  - vault_id: "V_ETH_MAIN"
+    owner: "borrower_eth"
+    branch: "ETH"
+    debt_pm: 250000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.04
+  - vault_id: "V_BTC_MAIN"
+    owner: "borrower_btc"
+    branch: "BTC"
+    debt_pm: 200000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.045
+  - vault_id: "V_SOL_RISKY"
+    owner: "borrower_sol"
+    branch: "SOL"
+    # SOL starts at 185% CR (>175% mint MCR) -> -50% SOL crash pushes CR to 92.5% < 125% liq CR
+    # SOL SP (50k) + Insurance Reserve (35k) absorb full underwater crash with 0 contagion to ETH/BTC
+    debt_pm: 65000.0
+    initial_cr: 1.85
+    borrow_rate_apr: 0.06
+  - vault_id: "V_SP_ETH"
+    owner: "sp_eth_lp"
+    branch: "ETH"
+    debt_pm: 60000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.05
+    deposit_to_sp_branch: "ETH"
+  - vault_id: "V_SP_BTC"
+    owner: "sp_btc_lp"
+    branch: "BTC"
+    debt_pm: 60000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.05
+    deposit_to_sp_branch: "BTC"
+  - vault_id: "V_SP_SOL"
+    owner: "sp_sol_lp"
+    branch: "ETH"
+    debt_pm: 50000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.05
+    deposit_to_sp_branch: "SOL"
+  - vault_id: "V_INS_INIT"
+    owner: "ins_funder"
+    branch: "ETH"
+    debt_pm: 35000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.05
+    deposit_to_insurance: true
+
+agent_numeraire:
+  arb: 900000.0
+  whistleblower: 20000.0
+
+agent_pm_mints:
+  # ~30% bank-run wave (450k PM out of ~1.5M+ circulating)
+  whale_seller: 450000.0
+  dynamic_staker: 100000.0
+
+bank_run:
+  enabled: true
+  agent_id: "whale_seller"
+  start_hour: 48
+  wave_hours: 8
+
+whistleblower:
+  enabled: true
+  dispute_bond_pm: 5000.0
+  deviation_threshold: 0.012
+
+oracle:
+  s_min_pm: 1000.0
+  dispute_bond_min_pm: 5000.0
+  nodes:
+    - node_id: "honest_1"
+      stake_pm: 180000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "honest_2"
+      stake_pm: 180000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "honest_dynamic"
+      stake_pm: 50000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "whistleblower"
+      stake_pm: 20000.0
+      role: "whistleblower"
+      is_court_voter: true
+
+shocks:
+  - hour: 48
+    collateral_multipliers:
+      SOL: 0.50
+      ETH: 0.85
+      BTC: 0.85

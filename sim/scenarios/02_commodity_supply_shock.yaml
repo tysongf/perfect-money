@@ -1,0 +1,85 @@
+name: "02_commodity_supply_shock"
+description: "Sudden +40% real Energy price shock (electricity + oil_gas) at hour 48; verifies <2% peg recovery within 14 days"
+duration_hours: 504
+shock_hour: 48
+round_interval_hours: 6
+k_pfc: 1.5
+basket_hourly_noise_sigma: 0.0003
+
+peg_controller:
+  mode: "patched_decoupled"
+
+amm:
+  pm_reserve: 200000.0
+  numeraire_reserve: 200000.0
+  fee_rate: 0.003
+
+initial_vaults:
+  - vault_id: "V_ETH_MAIN"
+    owner: "borrower_eth"
+    branch: "ETH"
+    debt_pm: 200000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.04
+    deposit_to_sp_branch: "ETH"
+  - vault_id: "V_BTC_MAIN"
+    owner: "borrower_btc"
+    branch: "BTC"
+    debt_pm: 150000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.045
+    deposit_to_sp_branch: "BTC"
+  - vault_id: "V_SOL_MAIN"
+    owner: "borrower_sol"
+    branch: "SOL"
+    debt_pm: 50000.0
+    initial_cr: 2.60
+    borrow_rate_apr: 0.055
+    deposit_to_sp_branch: "SOL"
+  - vault_id: "V_INS_INIT"
+    owner: "ins_funder"
+    branch: "ETH"
+    debt_pm: 30000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.05
+    deposit_to_insurance: true
+
+agent_numeraire:
+  arb: 600000.0
+  whistleblower: 20000.0
+
+agent_pm_mints:
+  dynamic_staker: 100000.0
+
+whistleblower:
+  enabled: true
+  dispute_bond_pm: 5000.0
+  deviation_threshold: 0.012
+
+oracle:
+  s_min_pm: 1000.0
+  dispute_bond_min_pm: 5000.0
+  nodes:
+    # 900k locked vs ~1.63M supply + 400k AMM = 2.03M exposure -> CoC_51 = 459k >= 3*PfC_unthrottled (456.75k)
+    - node_id: "honest_1"
+      stake_pm: 350000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "honest_2"
+      stake_pm: 350000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "honest_dynamic"
+      stake_pm: 150000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "whistleblower"
+      stake_pm: 50000.0
+      role: "whistleblower"
+      is_court_voter: true
+
+shocks:
+  - hour: 48
+    basket_multipliers:
+      electricity: 1.40
+      oil_gas: 1.40

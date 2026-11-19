@@ -1,0 +1,110 @@
+name: "01_oracle_cartel_bribe"
+description: "49% colluding oracle cartel pushes +10% false price + wide outlier attempt vs 48h court & whistleblower"
+duration_hours: 504
+shock_hour: 48
+round_interval_hours: 6
+k_pfc: 1.5
+basket_hourly_noise_sigma: 0.0004
+
+peg_controller:
+  mode: "patched_decoupled"
+
+amm:
+  pm_reserve: 200000.0
+  numeraire_reserve: 200000.0
+  fee_rate: 0.003
+
+initial_vaults:
+  - vault_id: "V_ETH_MAIN"
+    owner: "borrower_eth"
+    branch: "ETH"
+    debt_pm: 160000.0
+    initial_cr: 2.30
+    borrow_rate_apr: 0.05
+    deposit_to_sp_branch: "ETH"
+  - vault_id: "V_BTC_MAIN"
+    owner: "borrower_btc"
+    branch: "BTC"
+    debt_pm: 120000.0
+    initial_cr: 2.30
+    borrow_rate_apr: 0.055
+    deposit_to_sp_branch: "BTC"
+  - vault_id: "V_SOL_MAIN"
+    owner: "borrower_sol"
+    branch: "SOL"
+    debt_pm: 40000.0
+    initial_cr: 2.40
+    borrow_rate_apr: 0.06
+    deposit_to_sp_branch: "SOL"
+  - vault_id: "V_INS_INIT"
+    owner: "ins_funder"
+    branch: "ETH"
+    debt_pm: 30000.0
+    initial_cr: 2.50
+    borrow_rate_apr: 0.05
+    deposit_to_insurance: true
+
+agent_numeraire:
+  arb: 400000.0
+  cartel_trader: 100000.0
+  whistleblower: 20000.0
+
+agent_pm_mints:
+  cartel_trader: 20000.0
+  whistleblower: 20000.0
+  dynamic_staker: 100000.0
+
+whistleblower:
+  enabled: true
+  dispute_bond_pm: 5000.0
+  deviation_threshold: 0.012
+
+oracle:
+  s_min_pm: 1000.0
+  dispute_bond_min_pm: 5000.0
+  nodes:
+    # Exact 51% honest+whistleblower (408,000 PM) vs 49% cartel (392,000 PM) -> total 800,000 PM locked
+    # Total supply ~1.49M + AMM liq 400k = 1.89M exposure -> CoC_51 = 408k < 3*PfC triggers slight guard until stake
+    - node_id: "honest_1"
+      stake_pm: 184000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "honest_2"
+      stake_pm: 184000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "honest_dynamic"
+      stake_pm: 20000.0
+      role: "honest"
+      is_court_voter: true
+    - node_id: "whistleblower"
+      stake_pm: 20000.0
+      role: "whistleblower"
+      is_court_voter: true
+    - node_id: "cartel_core_1"
+      stake_pm: 166000.0
+      role: "cartel"
+      is_court_voter: true
+    - node_id: "cartel_core_2"
+      stake_pm: 166000.0
+      role: "cartel"
+      is_court_voter: true
+    - node_id: "cartel_outlier"
+      stake_pm: 60000.0
+      role: "cartel"
+      is_court_voter: true
+
+cartel_attack:
+  start_hour: 48
+  end_hour: 240
+  # First attack round sees honest_1 temporarily offline during commit -> 49% cartel captures P_med
+  # -> Whistleblower escalates to 48h court -> 2-year locked honest majority overturns & nuclear-slashes cartel
+  outage_first_attack_round: true
+  outlier_sybil_bias: 0.45
+  bias_by_asset:
+    electricity: 0.10
+    oil_gas: 0.10
+    grain: 0.10
+    metals: 0.10
+    housing: 0.10
+    datacenter_power: 0.10
