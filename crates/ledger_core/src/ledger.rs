@@ -16,6 +16,8 @@ pub enum LedgerError {
     ZeroTxBindingHash,
     #[error("insufficient public vault balance: requested {requested}, available {available}")]
     InsufficientVaultBalance { requested: u64, available: u128 },
+    #[error("insufficient pocket escrow balance: requested {requested}, available {available}")]
+    InsufficientPocketEscrow { requested: u64, available: u128 },
     #[error("unknown or expired merkle root")]
     UnknownMerkleRoot,
     #[error("nullifier already spent")]
@@ -68,6 +70,7 @@ pub struct LedgerState {
     pub total_issued_supply: u128,
     pub public_vault_balance: u128,
     pub total_shielded_supply: u128,
+    pub total_pocket_escrow: u128,
     pub collected_fees: u128,
 }
 
@@ -95,6 +98,7 @@ impl LedgerState {
             total_issued_supply: 0,
             public_vault_balance: 0,
             total_shielded_supply: 0,
+            total_pocket_escrow: 0,
             collected_fees: 0,
         }
     }
@@ -131,6 +135,40 @@ impl LedgerState {
         }
         self.public_vault_balance -= amount as u128;
         self.total_issued_supply -= amount as u128;
+        self.assert_conservation_invariant();
+        Ok(())
+    }
+
+    /// Phase 3 escrow hook: moves unshielded PM into capped offline pocket escrow.
+    pub fn lock_to_pocket_escrow(&mut self, amount: u64) -> Result<(), LedgerError> {
+        if amount == 0 {
+            return Err(LedgerError::ZeroAmount);
+        }
+        if self.public_vault_balance < amount as u128 {
+            return Err(LedgerError::InsufficientVaultBalance {
+                requested: amount,
+                available: self.public_vault_balance,
+            });
+        }
+        self.public_vault_balance -= amount as u128;
+        self.total_pocket_escrow += amount as u128;
+        self.assert_conservation_invariant();
+        Ok(())
+    }
+
+    /// Phase 3 escrow hook: releases settled or reclaimed pocket escrow back to `public_vault_balance`.
+    pub fn release_from_pocket_escrow(&mut self, amount: u64) -> Result<(), LedgerError> {
+        if amount == 0 {
+            return Err(LedgerError::ZeroAmount);
+        }
+        if self.total_pocket_escrow < amount as u128 {
+            return Err(LedgerError::InsufficientPocketEscrow {
+                requested: amount,
+                available: self.total_pocket_escrow,
+            });
+        }
+        self.total_pocket_escrow -= amount as u128;
+        self.public_vault_balance += amount as u128;
         self.assert_conservation_invariant();
         Ok(())
     }
@@ -273,7 +311,10 @@ impl LedgerState {
 
     pub fn assert_conservation_invariant(&self) {
         assert_eq!(
-            self.public_vault_balance + self.total_shielded_supply + self.collected_fees,
+            self.public_vault_balance
+                + self.total_shielded_supply
+                + self.total_pocket_escrow
+                + self.collected_fees,
             self.total_issued_supply,
             "supply conservation invariant violated"
         );
@@ -444,6 +485,74 @@ mod tests {
         assert_eq!(ledger.public_vault_balance, 0);
         assert_eq!(ledger.total_shielded_supply, 485);
         assert_eq!(ledger.collected_fees, 15);
+    }
+
+    #[test]
+    fn test_pocket_escrow_lock_release_and_conservation() {
+        let verifier = MockVerifier { accept: true };
+        let mut ledger = LedgerState::new();
+        ledger.mint_vault_supply(500).unwrap();
+
+        let s1 = ShieldTx {
+            mint_amount: 500,
+            out_commitment: FieldElement::from(11u64),
+            tx_binding_hash: FieldElement::from(21u64),
+            proof: vec![],
+        };
+        ledger.apply_shield(&s1, &verifier).unwrap();
+
+        let u1 = UnshieldTx {
+            merkle_root: ledger.current_root(),
+            nullifier: FieldElement::from(31u64),
+            change_commitment: FieldElement::from(41u64),
+            burn_amount: 300,
+            fee: 0,
+            tx_binding_hash: FieldElement::from(51u64),
+            proof: vec![],
+        };
+        ledger.apply_unshield(&u1, &verifier).unwrap();
+        assert_eq!(ledger.public_vault_balance, 300);
+
+        assert_eq!(ledger.lock_to_pocket_escrow(0), Err(LedgerError::ZeroAmount));
+        assert_eq!(
+            ledger.lock_to_pocket_escrow(301),
+            Err(LedgerError::InsufficientVaultBalance {
+                requested: 301,
+                available: 300,
+            })
+        );
+        ledger.lock_to_pocket_escrow(300).unwrap();
+        assert_eq!(ledger.public_vault_balance, 0);
+        assert_eq!(ledger.total_pocket_escrow, 300);
+        assert_eq!(ledger.total_shielded_supply, 200);
+
+        assert_eq!(
+            ledger.release_from_pocket_escrow(0),
+            Err(LedgerError::ZeroAmount)
+        );
+        assert_eq!(
+            ledger.release_from_pocket_escrow(301),
+            Err(LedgerError::InsufficientPocketEscrow {
+                requested: 301,
+                available: 300,
+            })
+        );
+
+        ledger.release_from_pocket_escrow(120).unwrap();
+        assert_eq!(ledger.total_pocket_escrow, 180);
+        assert_eq!(ledger.public_vault_balance, 120);
+
+        let settle = ShieldTx {
+            mint_amount: 120,
+            out_commitment: FieldElement::from(61u64),
+            tx_binding_hash: FieldElement::from(71u64),
+            proof: vec![],
+        };
+        ledger.apply_shield(&settle, &verifier).unwrap();
+        assert_eq!(ledger.total_shielded_supply, 320);
+        assert_eq!(ledger.total_pocket_escrow, 180);
+        assert_eq!(ledger.total_issued_supply, 500);
+        ledger.assert_conservation_invariant();
     }
 }
 
