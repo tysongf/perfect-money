@@ -1,0 +1,8 @@
+[package]
+name = "shielded_transfer"
+type = "bin"
+authors = ["Perfect Money"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+

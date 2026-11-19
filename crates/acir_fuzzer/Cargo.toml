@@ -1,0 +1,17 @@
+[package]
+name = "acir_fuzzer"
+version = "0.1.0"
+edition = "2024"
+description = "Stage 1 deterministic ACIR witness-mutation and relational fuzzer with Barretenberg oracle"
+
+[dependencies]
+acir = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0", features = ["bn254"] }
+acvm_blackbox_solver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0" }
+anyhow = "1.0"
+base64 = "0.22"
+bn254_blackbox_solver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0" }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.14"
+

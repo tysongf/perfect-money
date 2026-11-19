@@ -1,0 +1,22 @@
+# Rust / Cargo build outputs
+/target/
+crates/*/target/
+Cargo.lock
+
+# Noir / Barretenberg build & proof artifacts (keep Prover.toml tracked)
+circuits/*/target/
+*.gz
+**/vk
+**/vk_hash
+**/proof
+**/public_inputs
+
+# Python simulator artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.parquet
+
+# OS / Editor
+.DS_Store
