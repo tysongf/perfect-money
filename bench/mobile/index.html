@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Perfect Money — Mobile ZK Proving Benchmark</title>
+    <style>
+      :root {
+        --bg: #0b0f17;
+        --panel: #131a26;
+        --border: #233046;
+        --text: #e6edf7;
+        --muted: #8ea0b8;
+        --accent: #38bdf8;
+        --pass-bg: rgba(34, 197, 94, 0.16);
+        --pass-fg: #4ade80;
+        --fail-bg: rgba(239, 68, 68, 0.16);
+        --fail-fg: #f87171;
+        --warn-bg: rgba(245, 158, 11, 0.14);
+        --warn-fg: #fbbf24;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.45;
+      }
+      .container {
+        max-width: 1080px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.35rem;
+        letter-spacing: -0.01em;
+      }
+      .subtitle {
+        color: var(--muted);
+        font-size: 0.9rem;
+        margin-top: 2px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .card-title {
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0 0 10px 0;
+      }
+      .telemetry-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 10px;
+      }
+      .kv-label {
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      .kv-val {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.85rem;
+        word-break: break-word;
+      }
+      .banner-warn {
+        margin-top: 10px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: var(--warn-bg);
+        border: 1px solid rgba(245, 158, 11, 0.35);
+        color: var(--warn-fg);
+        font-size: 0.85rem;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.88rem;
+        color: var(--muted);
+      }
+      select,
+      button {
+        font: inherit;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: #0f1622;
+        color: var(--text);
+        padding: 8px 12px;
+      }
+      button {
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 0.88rem;
+        transition: opacity 0.15s, border-color 0.15s;
+      }
+      button.primary {
+        background: #0284c7;
+        border-color: #38bdf8;
+        color: #fff;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .status {
+        margin-top: 10px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.82rem;
+        color: var(--accent);
+        min-height: 1.2em;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.84rem;
+        white-space: nowrap;
+      }
+      th,
+      td {
+        text-align: right;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 0.78rem;
+      }
+      td.mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 700;
+      }
+      .badge-pass {
+        background: var(--pass-bg);
+        color: var(--pass-fg);
+      }
+      .badge-fail {
+        background: var(--fail-bg);
+        color: var(--fail-fg);
+      }
+      .badge-warn {
+        background: var(--warn-bg);
+        color: var(--warn-fg);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Perfect Money — Mobile ZK Proving Benchmark</h1>
+        <div class="subtitle">
+          Noir 1.0.0 (`noir_js`) + Barretenberg 6.0.0 (`bb.js` UltraHonk WASM Worker) · Phase 1 Gate &lt; 2.0s warm prove
+        </div>
+      </header>
+
+      <section class="card">
+        <h2 class="card-title">Device Telemetry</h2>
+        <div class="telemetry-grid">
+          <div>
+            <div class="kv-label">crossOriginIsolated (SharedArrayBuffer)</div>
+            <div class="kv-val" id="tel-isolated"></div>
+          </div>
+          <div>
+            <div class="kv-label">hardwareConcurrency</div>
+            <div class="kv-val" id="tel-cores"></div>
+          </div>
+          <div>
+            <div class="kv-label">deviceMemory</div>
+            <div class="kv-val" id="tel-mem"></div>
+          </div>
+          <div>
+            <div class="kv-label">User Agent</div>
+            <div class="kv-val" id="tel-ua"></div>
+          </div>
+        </div>
+        <div class="banner-warn" id="isolation-banner" hidden>
+          <code>window.crossOriginIsolated</code> is <strong>false</strong>: multi-threaded WASM (<code>SharedArrayBuffer</code>) is disabled and proving will run on <strong>1 thread</strong>.
+          Over LAN, launch <code>bash scripts/bench_mobile_phone_server.sh</code> and open the <code>https://...</code> URL (accepting the self-signed certificate) for multi-threaded WASM.
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Benchmark Controls</h2>
+        <div class="controls">
+          <label>
+            Threads:
+            <select id="thread-mode">
+              <option value="auto">Auto (multi-thread if isolated)</option>
+              <option value="1">1 thread (single-thread fallback)</option>
+            </select>
+          </label>
+          <label>
+            Timed runs:
+            <select id="iter-count">
+              <option value="3" selected>3 (+1 warmup)</option>
+              <option value="1">1 (+1 warmup)</option>
+              <option value="5">5 (+1 warmup)</option>
+            </select>
+          </label>
+          <button class="primary" id="run-all">Run All 3 Circuits</button>
+          <button class="circuit-btn" data-circuit="shield">shield</button>
+          <button class="circuit-btn" data-circuit="unshield">unshield</button>
+          <button class="circuit-btn" data-circuit="shielded_transfer">shielded_transfer</button>
+          <button id="copy-json" disabled>Copy JSON Report</button>
+        </div>
+        <div class="status" id="status-line">Ready. First run downloads &amp; caches ~8 MiB CRS into IndexedDB.</div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Results</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Circuit</th>
+                <th>Threads</th>
+                <th>Cold Init</th>
+                <th>Witness</th>
+                <th>Prove Min</th>
+                <th>Prove Med</th>
+                <th>Prove Max</th>
+                <th>Verify</th>
+                <th>Proof Size</th>
+                <th>Warm Total</th>
+                <th>&lt; 2.0s Gate</th>
+              </tr>
+            </thead>
+            <tbody id="results-body">
+              <tr>
+                <td colspan="11" style="text-align: center; color: var(--muted)">
+                  Tap "Run All 3 Circuits" or a single circuit above to begin.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
+

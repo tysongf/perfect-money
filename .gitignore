@@ -20,3 +20,10 @@ __pycache__/
 
 # OS / Editor
 .DS_Store
+
+# Mobile benchmark artifacts
+node_modules/
+bench/mobile/dist/
+bench/mobile/public/circuits/
+bench/mobile/.certs/
+

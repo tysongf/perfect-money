@@ -1,0 +1,21 @@
+{
+  "name": "perfect-money-mobile-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fixtures": "node scripts/prepare_fixtures.mjs",
+    "bench:native": "node scripts/bench_native.mjs",
+    "bench:wasm": "node scripts/bench_wasm_node.mjs",
+    "bench": "npm run fixtures && npm run bench:native && npm run bench:wasm",
+    "build": "npm run fixtures && vite build",
+    "serve": "npm run fixtures && vite --host 0.0.0.0 --port 4173"
+  },
+  "dependencies": {
+    "@aztec-foundation/bb.js": "6.0.0",
+    "@noir-lang/noir_js": "1.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
