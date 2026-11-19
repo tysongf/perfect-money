@@ -8,6 +8,20 @@ use crate::types::{
     SecurityLevel, UncooperativeDrainRequest, VOUCHER_FORMAT_VERSION, VoucherBundle,
 };
 use p256::ecdsa::SigningKey;
+use serde::{Deserialize, Serialize};
+
+/// Serializable encrypted-wallet snapshot for an honest P-256 enclave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedEnclaveState {
+    pub signing_key_hex: String,
+    pub attestation: HardwareAttestation,
+    pub policy: PocketPolicy,
+    pub total_funded: u64,
+    pub counter: u64,
+    pub cumulative_spent: u64,
+    pub last_voucher_hash: [u8; 32],
+    pub closed: bool,
+}
 
 /// Hardware vendor certificate authority issuing P-256 device attestations.
 #[derive(Clone)]
@@ -168,6 +182,46 @@ impl SoftwareMockEnclave {
     pub fn device_pk(&self) -> [u8; 33] {
         self.attestation.device_pk
     }
+
+    pub fn export_state(&self) -> PersistedEnclaveState {
+        PersistedEnclaveState {
+            signing_key_hex: hex::encode(self.signing_key.to_bytes()),
+            attestation: self.attestation.clone(),
+            policy: self.policy.clone(),
+            total_funded: self.total_funded,
+            counter: self.counter,
+            cumulative_spent: self.cumulative_spent,
+            last_voucher_hash: self.last_voucher_hash,
+            closed: self.closed,
+        }
+    }
+
+    pub fn from_persisted_state(state: PersistedEnclaveState) -> Result<Self, VoucherError> {
+        state.policy.validate()?;
+        let sk_bytes = hex::decode(&state.signing_key_hex)
+            .map_err(|_| VoucherError::InvalidPublicKey)?;
+        let sk_arr: [u8; 32] = sk_bytes
+            .try_into()
+            .map_err(|_| VoucherError::InvalidPublicKey)?;
+        let signing_key =
+            SigningKey::from_bytes(&sk_arr.into()).map_err(|_| VoucherError::InvalidPublicKey)?;
+        let pk = compressed_pk(&signing_key);
+        if pk != state.attestation.device_pk {
+            return Err(VoucherError::DeviceKeyMismatch);
+        }
+        let pocket_id = derive_pocket_id(state.policy.chain_id, &pk);
+        Ok(Self {
+            signing_key,
+            attestation: state.attestation,
+            policy: state.policy,
+            pocket_id,
+            total_funded: state.total_funded,
+            counter: state.counter,
+            cumulative_spent: state.cumulative_spent,
+            last_voucher_hash: state.last_voucher_hash,
+            closed: state.closed,
+        })
+    }
 }
 
 impl SecureEnclave for SoftwareMockEnclave {
@@ -188,7 +242,11 @@ impl SecureEnclave for SoftwareMockEnclave {
     }
 
     fn remaining_balance(&self) -> u64 {
-        self.total_funded.saturating_sub(self.cumulative_spent)
+        if self.closed {
+            0
+        } else {
+            self.total_funded.saturating_sub(self.cumulative_spent)
+        }
     }
 
     fn is_closed(&self) -> bool {

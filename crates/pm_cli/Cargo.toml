@@ -1,0 +1,23 @@
+[package]
+name = "pm_cli"
+version = "0.1.0"
+edition = "2024"
+description = "Phase 4 Perfect Money Wedge MVP CLI wallet and air-gapped merchant terminal"
+
+[[bin]]
+name = "pm-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+hex = "0.4"
+ledger_core = { path = "../ledger_core" }
+offline_vouchers = { path = "../offline_vouchers" }
+pm_sdk = { path = "../pm_sdk" }
+serde_json = "1.0"
+
+[dev-dependencies]
+pm_node = { path = "../pm_node" }
+tempfile = "3.14"
+

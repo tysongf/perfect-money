@@ -15,8 +15,8 @@ pub use crypto::{
     malleate_to_high_s, sign_low_s, signing_key_from_seed, verify_low_s,
 };
 pub use enclave::{
-    CompromisedSnapshot, CompromisedTestEnclave, SecureEnclave, SoftwareMockEnclave, VendorCa,
-    sign_hop_endorsement, sign_uncooperative_drain_request,
+    CompromisedSnapshot, CompromisedTestEnclave, PersistedEnclaveState, SecureEnclave,
+    SoftwareMockEnclave, VendorCa, sign_hop_endorsement, sign_uncooperative_drain_request,
 };
 pub use error::VoucherError;
 pub use offline_receiver::OfflineMerchantWallet;

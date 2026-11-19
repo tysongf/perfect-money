@@ -1,0 +1,21 @@
+[package]
+name = "pm_sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Phase 4 Perfect Money client SDK: Grumpkin ECDH note encryption, UltraHonk prover, encrypted keystore, and offline pocket wallet"
+
+[dependencies]
+acir = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0", features = ["bn254"] }
+anyhow = "1.0"
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.13"
+ledger_core = { path = "../ledger_core" }
+offline_vouchers = { path = "../offline_vouchers" }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tempfile = "3.14"
+thiserror = "2.0"
+
