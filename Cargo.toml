@@ -6,6 +6,7 @@ members = [
     "crates/evil_prover_harness",
     "crates/smt_checker",
     "crates/offline_vouchers",
+    "crates/monetary_core",
     "crates/pm_sdk",
     "crates/pm_node",
     "crates/pm_cli",

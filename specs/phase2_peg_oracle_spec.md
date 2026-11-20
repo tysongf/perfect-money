@@ -209,3 +209,14 @@ perfect-money/
 4. **CoC > PfC Gate:** Telemetry confirms `CoC >= 3.0 * PfC` across all simulated liquidity tiers (via yield routing + auto-throttling).
 5. **Phase 1 Bridge Gate:** Simulated vault mint/burn supply deltas compile and verify end-to-end through Phase 1's `circuits/shield` and `circuits/unshield` Noir circuits.
 
+---
+
+## 6. Consensus-Deterministic Fixed-Point Rust Core (`crates/monetary_core`)
+
+To eliminate floating-point non-determinism across node architectures before testnet deployment, `crates/monetary_core` provides a 100% integer fixed-point (`u128` / `i128`, zero `f32` / `f64` arithmetic in consensus code) implementation mirroring `sim/engine/`:
+
+* **Fixed-Point Scales (`fixed.rs`):** `PM_SCALE = 1_000_000` (`1e6` micro-PM and micro-numeraire, matching `ledger_core` 1:1) and `SCALE = 1_000_000_000` (`1e9` asset prices, weights, collateral ratios, APRs, and nano-collateral quantities), backed by exact 256-bit `mul_div_*`, `isqrt_u256`, and 18-decimal `WAD` `ln_wad` / `exp_wad` / `decay_half_life`.
+* **Monetary & Oracle Modules (`peg.rs`, `oracle.rs`, `vaults.rs`, `engine.rs`):** Implements `BasketSpec`, `compute_auto_throttle`, `PegController` (`PatchedDecoupled` & `LegacySpotDrivenR`), commit-reveal `OracleMarket` with frozen historical EWMA tolerance bands and 48-hour timestamp-anchored court, isolated `ETH`/`BTC`/`SOL` vaults, Hybrid A3 3-tier liquidations, Liquity-v2 hard redemptions, and `MonetaryEngine`.
+* **Atomic Ledger Bridge (`ledger_bridge_pm`):** `MonetaryEngine::{mint_vault_to_ledger, repay_vault_from_ledger, redeem_pm_from_ledger}` synchronizes vault debt issuance and burns 1:1 with `ledger_core::LedgerState::total_issued_supply`, enforcing exact `u128` bucket conservation across all balances (`assert_ledger_bridge_conservation`).
+
+
